@@ -22,17 +22,19 @@ The Job tools panel includes:
   local filtering.
 - The “About the job” section automatically expands when a “More” button is
   available; other job-description sections stay unchanged.
-- Main content width (70–140% of the viewport), centered as it grows, and
-  job-details pane width controls on desktop layouts.
+- LinkedIn main-content width controls (70–140% of the viewport), centered as it
+  grows, plus independent results and details pane widths (30–70%) for each
+  supported desktop split-view board.
 - A 500px list editor (responsive on narrow screens) and a tools panel capped at
   1000px tall.
 - Per-card actions to block an employer, an employer/position pair, or a position
   across supported job boards.
 - On desktop search pages for CVbankas, CV-Online, CVMarket, CV.lt, and Užimtumo
   tarnyba, selecting a vacancy keeps results on the left and opens its details on
-  the right in a viewport-height pane. The UZT pane hides the site header.
-  LinkedIn keeps its native split view; Work in Lithuania and narrower screens
-  keep the board's normal navigation.
+  the right in a viewport-height pane. The preview hides the board header and
+  navigation while retaining skill and salary highlights; links in the preview
+  open in a new tab. LinkedIn keeps its native split view; Work in Lithuania and
+  narrower screens keep the board's normal navigation.
 
 Job filters and list navigation are in the right column. Viewed, hidden, and
 applied status filters are LinkedIn-specific. Blocked phrases, employers, and

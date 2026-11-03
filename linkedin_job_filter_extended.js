@@ -24,6 +24,7 @@
     const STORAGE_KEY = 'linkedinJobFilterSettings';
     const FILTERS = { SHOW_ALL: 'SHOW_ALL', SHOW_PROMOTED: 'SHOW_PROMOTED', SHOW_NORMAL: 'SHOW_NORMAL' };
     const SALARY_FILTER_TOLERANCE = 0.1;
+    const splitViewSites = new Set(['cvbankas', 'cvonline', 'cvmarket', 'cvlt', 'uzt']);
     const defaults = {
         activeFilter: FILTERS.SHOW_ALL,
         onlyUnviewed: false,
@@ -38,7 +39,10 @@
         skillCategories: [],
         salaryMinimum: 0,
         mainWidth: 100,
-        detailsWidth: 65
+        detailsWidth: 65,
+        splitViewWidths: Object.fromEntries([...splitViewSites].map(site => [
+            site, { mainWidth: 55, detailsWidth: 45 }
+        ]))
     };
     let settings = { ...defaults };
     let openMenuCard = null;
@@ -142,6 +146,13 @@
         settings.salaryMinimum = Number.isFinite(salaryMinimum) ? Math.max(0, salaryMinimum) : 0;
         settings.mainWidth = Math.min(140, Math.max(70, Number(settings.mainWidth) || 100));
         settings.detailsWidth = Math.min(85, Math.max(50, Number(settings.detailsWidth) || 65));
+        settings.splitViewWidths = Object.fromEntries([...splitViewSites].map(site => {
+            const widths = settings.splitViewWidths?.[site] || {};
+            return [site, {
+                mainWidth: Math.min(70, Math.max(30, Number(widths.mainWidth) || 55)),
+                detailsWidth: Math.min(70, Math.max(30, Number(widths.detailsWidth) || 45))
+            }];
+        }));
     }
 
     await loadSettings();
@@ -237,7 +248,7 @@
             height: 100dvh;
             z-index: 10001;
             grid-template-rows: auto minmax(0, 1fr);
-            width: 45vw;
+            width: min(var(--li-tools-preview-width, 45vw), 100vw);
             border-left: 1px solid #767676;
             background: #fff;
             color: #202124;
@@ -254,8 +265,8 @@
                 display: flex !important;
                 flex-direction: column !important;
                 gap: 0 !important;
-                width: 55vw !important;
-                max-width: 55vw !important;
+                width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
+                max-width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
                 margin: 0 !important;
             }
             body.li-tools-split-view[data-li-tools-site="cvbankas"] #main_wrapper > #hero,
@@ -272,16 +283,16 @@
             body.li-tools-split-view[data-li-tools-site="cvbankas"] #main_wrapper > .content_placeholder { display: none !important; }
             body.li-tools-split-view[data-li-tools-site="cvbankas"] #js_id_id_job_ad_list { width: 100% !important; }
             body.li-tools-split-view[data-li-tools-site="cvonline"] .search__container > .container {
-                width: 55vw !important;
-                max-width: 55vw !important;
+                width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
+                max-width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
                 margin: 0 !important;
             }
             body.li-tools-split-view[data-li-tools-site="cvonline"] .search,
             body.li-tools-split-view[data-li-tools-site="cvonline"] .search__content { width: 100% !important; min-width: 0 !important; }
             body.li-tools-split-view[data-li-tools-site="cvonline"] .vacancies-list { width: 100% !important; min-width: 0 !important; }
             body.li-tools-split-view[data-li-tools-site="cvmarket"] section[class~="lg:container"] {
-                width: 55vw !important;
-                max-width: 55vw !important;
+                width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
+                max-width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
                 margin-left: 0 !important;
                 margin-right: 0 !important;
             }
@@ -292,8 +303,8 @@
             body.li-tools-split-view[data-li-tools-site="cvmarket"] section[class~="lg:container"] > main,
             body.li-tools-split-view[data-li-tools-site="cvmarket"] .jobs-list { width: 100% !important; min-width: 0 !important; }
             body.li-tools-split-view[data-li-tools-site="cvlt"] > div[class~="lg:container"][class~="pt-7"] {
-                width: 55vw !important;
-                max-width: 55vw !important;
+                width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
+                max-width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
                 margin-left: 0 !important;
                 margin-right: 0 !important;
             }
@@ -308,15 +319,15 @@
             }
             body.li-tools-split-view[data-li-tools-site="cvlt"] .jobs-list { width: 100% !important; min-width: 0 !important; }
             body.li-tools-split-view[data-li-tools-site="uzt"] app-public-job-vacancy-search {
-                flex: 0 0 calc(55vw - 32px) !important;
-                width: calc(55vw - 32px) !important;
-                max-width: calc(55vw - 32px) !important;
+                flex: 0 0 calc(min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) - 32px) !important;
+                width: calc(min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) - 32px) !important;
+                max-width: calc(min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) - 32px) !important;
                 min-width: 0 !important;
             }
             body.li-tools-split-view[data-li-tools-site="uzt"] app-root.uztis-bootstrap {
                 justify-content: flex-start !important;
-                width: calc(55vw - 32px) !important;
-                max-width: calc(55vw - 32px) !important;
+                width: calc(min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) - 32px) !important;
+                max-width: calc(min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) - 32px) !important;
                 margin-left: 0 !important;
                 margin-right: 0 !important;
             }
@@ -635,6 +646,10 @@
     const layoutSection = document.createElement('div');
     layoutSection.className = 'li-tools-section';
     layoutSection.appendChild(heading('Page layout'));
+    const layoutSite = getSite();
+    const splitLayout = splitViewSites.has(layoutSite);
+    const layoutSettings = splitLayout ? settings.splitViewWidths[layoutSite] : settings;
+    layoutSection.hidden = !splitLayout && layoutSite !== 'linkedin';
     function addRange(labelText, key, min, max, suffix) {
         const label = document.createElement('label');
         label.className = 'li-tools-field';
@@ -644,11 +659,11 @@
         input.type = 'range';
         input.min = String(min);
         input.max = String(max);
-        input.value = String(settings[key]);
+        input.value = String(layoutSettings[key]);
         input.setAttribute('aria-label', labelText);
         const update = () => {
-            settings[key] = Number(input.value);
-            text.textContent = `${labelText}: ${settings[key]}${suffix}`;
+            layoutSettings[key] = Number(input.value);
+            text.textContent = `${labelText}: ${layoutSettings[key]}${suffix}`;
             updateLayout();
         };
         input.addEventListener('input', update);
@@ -659,15 +674,23 @@
         layoutSection.appendChild(label);
         update();
     }
-    addRange('Main content width', 'mainWidth', 70, 140, '%');
-    addRange('Details pane width', 'detailsWidth', 50, 85, '%');
+    addRange(splitLayout ? 'Results pane width' : 'Main content width', 'mainWidth',
+        splitLayout ? 30 : 70, splitLayout ? 70 : 140, '%');
+    addRange('Details pane width', 'detailsWidth', splitLayout ? 30 : 50, splitLayout ? 70 : 85, '%');
     rightColumn.appendChild(layoutSection);
 
     rightColumn.appendChild(status);
 
     function updateLayout() {
-        document.documentElement.style.setProperty('--li-tools-main-width', `${settings.mainWidth}vw`);
-        document.documentElement.style.setProperty('--li-tools-details-width', `${settings.detailsWidth}%`);
+        const site = getSite();
+        if (splitViewSites.has(site)) {
+            const widths = settings.splitViewWidths[site];
+            document.documentElement.style.setProperty('--li-tools-results-width', `${widths.mainWidth}vw`);
+            document.documentElement.style.setProperty('--li-tools-preview-width', `${widths.detailsWidth}vw`);
+        } else {
+            document.documentElement.style.setProperty('--li-tools-main-width', `${settings.mainWidth}vw`);
+            document.documentElement.style.setProperty('--li-tools-details-width', `${settings.detailsWidth}%`);
+        }
         document.querySelectorAll('.li-tools-main-content, .li-tools-results-pane, .li-tools-details-pane, .li-tools-job-columns')
             .forEach(element => element.classList.remove('li-tools-main-content', 'li-tools-results-pane', 'li-tools-details-pane', 'li-tools-job-columns'));
         const lazyColumns = Array.from(document.querySelectorAll('[data-testid="lazy-column"]'));
@@ -984,11 +1007,100 @@
         return Array.from(new Set([...legacyCards, ...currentCards]));
     }
 
-    const splitViewSites = new Set(['cvbankas', 'cvonline', 'cvmarket', 'cvlt', 'uzt']);
     let jobPreview;
     let jobPreviewTitle;
     let jobPreviewFrame;
     let selectedJobUrl = '';
+    const previewObservers = new WeakMap();
+    const previewLinkObservers = new WeakMap();
+
+    function getJobPreviewDetails(doc, site) {
+        if (site === 'cvbankas') return doc.querySelector('#jobad_content_main');
+        if (site === 'cvonline') return doc.querySelector('.vacancy-content');
+        if (site === 'cvmarket') return doc.querySelector('body > div[class~="lg:container"]');
+        if (site === 'cvlt') return doc.querySelector('body > div[class~="lg:container"][class~="pt-6"] main');
+        if (site === 'uzt') return doc.querySelector('app-public-job-vacancy-detail main');
+        return null;
+    }
+
+    function openPreviewLinksInNewTabs(root) {
+        if (!root.querySelectorAll) return;
+        const links = [];
+        if (root.nodeType === 1 && root.matches('a[href]')) links.push(root);
+        links.push(...root.querySelectorAll('a[href]'));
+        links.forEach(link => {
+            link.target = '_blank';
+            const rel = new Set(link.rel.split(/\s+/).filter(Boolean));
+            rel.add('noopener');
+            link.rel = [...rel].join(' ');
+        });
+    }
+
+    function enhanceJobPreviewFrame() {
+        const doc = jobPreviewFrame?.contentDocument;
+        const site = getSite();
+        if (!doc?.head || !splitViewSites.has(site)) return;
+        openPreviewLinksInNewTabs(doc);
+        if (!previewLinkObservers.has(doc)) {
+            const observer = new doc.defaultView.MutationObserver(records => {
+                records.forEach(record => {
+                    if (record.type === 'attributes') openPreviewLinksInNewTabs(record.target);
+                    else record.addedNodes.forEach(openPreviewLinksInNewTabs);
+                });
+            });
+            observer.observe(doc.body, {
+                attributes: true,
+                attributeFilter: ['href', 'rel', 'target'],
+                childList: true,
+                subtree: true
+            });
+            previewLinkObservers.set(doc, observer);
+        }
+        let previewStyle = doc.getElementById('li-job-tools-preview-style');
+        if (!previewStyle) {
+            previewStyle = doc.createElement('style');
+            previewStyle.id = 'li-job-tools-preview-style';
+            previewStyle.textContent = `
+                .li-tools-skill { border-radius: 2px; padding: 0 2px; font-weight: 600; }
+                .li-tools-salary-above { background: #d8f3d4 !important; color: #173d12 !important; text-decoration: underline !important; }
+                .li-tools-salary-below { background: #ffe3dc !important; color: #5b2115 !important; text-decoration: underline wavy !important; }
+            `;
+            doc.head.appendChild(previewStyle);
+        }
+        const chromeSelectors = {
+            cvbankas: '#main_header',
+            cvonline: '.page-header',
+            cvmarket: 'body > header nav, body > div[class~="lg:container"] > nav',
+            cvlt: 'body > header',
+            uzt: '#topbar, #wrapper > header, #wrapper > nav, .quick-access-nav, nav.sort-pages'
+        };
+        doc.querySelectorAll(chromeSelectors[site])
+            .forEach(element => element.style.setProperty('display', 'none', 'important'));
+        const details = getJobPreviewDetails(doc, site);
+        if (!details) return;
+        if (site === 'uzt') {
+            details.querySelectorAll(`
+                nav, button, h1
+            `).forEach(element => {
+                if (element.parentElement === details || element.matches('nav')) {
+                    element.style.setProperty('display', 'none', 'important');
+                }
+            });
+            details.style.setProperty('padding-top', '0', 'important');
+            doc.querySelector('#content .announcement-text')
+                ?.closest('.entries')?.style.setProperty('display', 'none', 'important');
+        }
+        highlightSkills(details);
+        highlightSalaries(details);
+        if (!previewObservers.has(doc)) {
+            const observer = new doc.defaultView.MutationObserver(() => {
+                highlightSkills(details);
+                highlightSalaries(details);
+            });
+            observer.observe(details, { childList: true, characterData: true, subtree: true });
+            previewObservers.set(doc, observer);
+        }
+    }
 
     function getJobUrl(card) {
         const site = getSite();
@@ -1110,22 +1222,12 @@
             jobPreviewFrame.title = 'Selected job details';
             jobPreviewFrame.addEventListener('load', () => {
                 jobPreviewFrame.removeAttribute('aria-busy');
-                if (getSite() !== 'uzt') return;
-                const frameDocument = jobPreviewFrame.contentDocument;
-                if (!frameDocument?.head) return;
-                frameDocument.querySelectorAll(`
-                    #topbar, #wrapper > header, #wrapper > nav,
-                    header, .quick-access-nav, nav.sort-pages,
-                    app-public-job-vacancy-detail main > nav,
-                    app-public-job-vacancy-detail main > button,
-                    app-public-job-vacancy-detail main > h1
-                `).forEach(element => element.style.setProperty('display', 'none', 'important'));
-                frameDocument.querySelector('app-public-job-vacancy-detail main')
-                    ?.style.setProperty('padding-top', '0', 'important');
-                frameDocument.querySelector('#content .announcement-text')
-                    ?.closest('.entries')?.style.setProperty('display', 'none', 'important');
+                enhanceJobPreviewFrame();
                 jobPreviewFrame.contentWindow.scrollTo(0, 0);
-                setTimeout(() => jobPreviewFrame.contentWindow.scrollTo(0, 0), 300);
+                setTimeout(() => {
+                    enhanceJobPreviewFrame();
+                    jobPreviewFrame.contentWindow.scrollTo(0, 0);
+                }, 300);
             });
             header.append(jobPreviewTitle, closeButton);
             jobPreview.append(header, jobPreviewFrame);
@@ -1194,18 +1296,21 @@
     }
 
     function unwrapHighlights(root, selector) {
+        const ownerDocument = root.ownerDocument;
         root.querySelectorAll(selector).forEach(span => {
-            const contents = document.createDocumentFragment();
+            const contents = ownerDocument.createDocumentFragment();
             while (span.firstChild) contents.appendChild(span.firstChild);
             span.replaceWith(contents);
         });
     }
 
     function replaceTextNodes(root, matcher, createHighlight, validMatch = () => true) {
-        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        const ownerDocument = root.ownerDocument;
+        const nodeFilter = ownerDocument.defaultView.NodeFilter;
+        const walker = ownerDocument.createTreeWalker(root, nodeFilter.SHOW_TEXT, {
             acceptNode(node) {
                 return node.parentElement?.closest('script, style, button, input, textarea, select, option, [data-li-job-tools], .li-tools-salary-highlight') ?
-                    NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+                    nodeFilter.FILTER_REJECT : nodeFilter.FILTER_ACCEPT;
             }
         });
         const nodes = [];
@@ -1221,12 +1326,12 @@
                 precedingText = (precedingText + text).slice(-100);
                 continue;
             }
-            const fragment = document.createDocumentFragment();
+            const fragment = ownerDocument.createDocumentFragment();
             let lastIndex = 0;
             for (const match of matches) {
                 const start = match.index;
                 if (start < lastIndex) continue;
-                if (start > lastIndex) fragment.appendChild(document.createTextNode(text.slice(lastIndex, start)));
+                if (start > lastIndex) fragment.appendChild(ownerDocument.createTextNode(text.slice(lastIndex, start)));
                 fragment.appendChild(createHighlight(
                     match[0],
                     (precedingText + text.slice(0, start)).slice(-100),
@@ -1237,7 +1342,7 @@
             }
             precedingText = (precedingText + text).slice(-100);
             if (lastIndex === 0) continue;
-            if (lastIndex < text.length) fragment.appendChild(document.createTextNode(text.slice(lastIndex)));
+            if (lastIndex < text.length) fragment.appendChild(ownerDocument.createTextNode(text.slice(lastIndex)));
             textNode.parentNode.replaceChild(fragment, textNode);
         }
         return replacementCount;
@@ -1264,7 +1369,7 @@
             const skillByName = new Map(skills.map(skill => [skill.name.toLowerCase(), skill]));
             const matcher = new RegExp(skills.map(skill => skill.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'gi');
             count = replaceTextNodes(root, matcher, value => {
-                const span = document.createElement('span');
+                const span = root.ownerDocument.createElement('span');
                 const skill = skillByName.get(value.toLowerCase());
                 span.className = 'li-tools-skill li-tools-skill-highlight';
                 span.style.backgroundColor = skill.color;
@@ -1485,9 +1590,9 @@
         }
     }, true);
 
-    function createSalaryHighlight(value, precedingText = '', followingText = '') {
+    function createSalaryHighlight(value, precedingText = '', followingText = '', ownerDocument = document) {
         const range = monthlySalaryRange(value, precedingText, followingText);
-        const span = document.createElement('span');
+        const span = ownerDocument.createElement('span');
         span.className = 'li-tools-salary-highlight';
         if (range) {
             span.classList.add(range[1] >= settings.salaryMinimum ? 'li-tools-salary-above' : 'li-tools-salary-below');
@@ -1497,13 +1602,15 @@
     }
 
     function highlightSalaryRangesAcrossInlineElements(root) {
+        const ownerDocument = root.ownerDocument;
+        const nodeFilter = ownerDocument.defaultView.NodeFilter;
         const blocks = [...(root.matches('p, li, .salary-label, .salary_text, [data-component="badge"]') ? [root] : []), ...root.querySelectorAll('p, li, .salary-label, .salary_text, [data-component="badge"]')];
         let count = 0;
         for (const block of blocks) {
-            const walker = document.createTreeWalker(block, NodeFilter.SHOW_TEXT, {
+            const walker = ownerDocument.createTreeWalker(block, nodeFilter.SHOW_TEXT, {
                 acceptNode(node) {
                     return node.parentElement?.closest('script, style, button, input, textarea, select, option, [data-li-job-tools], .li-tools-salary-highlight') ?
-                        NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+                        nodeFilter.FILTER_REJECT : nodeFilter.FILTER_ACCEPT;
                 }
             });
             const entries = [];
@@ -1523,13 +1630,14 @@
                 const startEntry = entries.find(entry => start >= entry.start && start < entry.end);
                 const endEntry = entries.find(entry => end > entry.start && end <= entry.end);
                 if (!startEntry || !endEntry) continue;
-                const range = document.createRange();
+                const range = ownerDocument.createRange();
                 range.setStart(startEntry.node, start - startEntry.start);
                 range.setEnd(endEntry.node, end - endEntry.start);
                 const highlight = createSalaryHighlight(
                     match[0],
                     text.slice(Math.max(0, start - 100), start),
-                    text.slice(end, end + 100)
+                    text.slice(end, end + 100),
+                    ownerDocument
                 );
                 highlight.appendChild(range.extractContents());
                 range.insertNode(highlight);
@@ -1553,7 +1661,7 @@
         if (settings.salaryMinimum > 0) {
             count = highlightSalaryRangesAcrossInlineElements(root);
             count += replaceTextNodes(root, salaryMatcher, (value, precedingText, followingText) => {
-                const highlight = createSalaryHighlight(value, precedingText, followingText);
+                const highlight = createSalaryHighlight(value, precedingText, followingText, root.ownerDocument);
                 highlight.textContent = value;
                 return highlight;
             }, (match, content) => {
@@ -1725,6 +1833,7 @@
     function processPage() {
         updateLayout();
         setupJobPreview();
+        enhanceJobPreviewFrame();
         applyFilter();
         getJobCards().forEach(highlightSalaries);
         const details = document.querySelector('.jobs-description__content')
