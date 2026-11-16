@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Job Search Toolkit
 // @namespace    http://tampermonkey.net/
-// @version      6.17
+// @version      6.24
 // @description  Filter job listings, block matches, and highlight skills and salaries
 // @author       yange.xyz + matty
 // @match        https://www.linkedin.com/jobs/*
@@ -9,10 +9,12 @@
 // @match        https://www.cvonline.lt/*
 // @match        https://www.cvmarket.lt/*
 // @match        https://www.cv.lt/*
+// @match        https://pinokis.com/*
 // @match        https://jobs.workinlithuania.com/*
 // @match        https://uzt.lt/app/laisvos-darbo-vietos*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        unsafeWindow
 // @run-at       document-end
 // @license      MIT
 // ==/UserScript==
@@ -22,9 +24,15 @@
     if (window.top !== window.self) return;
 
     const STORAGE_KEY = 'linkedinJobFilterSettings';
+    const CV_DATABASE = 'jobSearchToolkitPreferredCV';
+    const CV_STORE = 'files';
+    const CV_RECORD = 'pinokis';
+    const MAX_CV_SIZE = 30 * 1024 * 1024;
     const FILTERS = { SHOW_ALL: 'SHOW_ALL', SHOW_PROMOTED: 'SHOW_PROMOTED', SHOW_NORMAL: 'SHOW_NORMAL' };
     const SALARY_FILTER_TOLERANCE = 0.1;
-    const splitViewSites = new Set(['cvbankas', 'cvonline', 'cvmarket', 'cvlt', 'uzt']);
+    const splitViewSites = new Set(['cvbankas', 'cvonline', 'cvmarket', 'cvlt', 'pinokis', 'uzt']);
+    const AUTO_PAGINATION_KEY = 'liJobToolsEmptyResultsPagination';
+    const PINOKIS_APPLIED_CONFIRMATION = 'CV sėkmingai įkeltas. Palinkėsim kantrybės laukiant skambučio! Per tą laiką paskaityk ką apie įmonę parašė kiti.';
     const defaults = {
         activeFilter: FILTERS.SHOW_ALL,
         onlyUnviewed: false,
@@ -34,6 +42,8 @@
         blockedEmployers: [],
         blockedEmployerPositions: [],
         blockedPositions: [],
+        appliedJobs: [],
+        hiddenJobs: [],
         skillsEnabled: true,
         skills: [],
         skillCategories: [],
@@ -41,7 +51,7 @@
         mainWidth: 100,
         detailsWidth: 65,
         splitViewWidths: Object.fromEntries([...splitViewSites].map(site => [
-            site, { mainWidth: 55, detailsWidth: 45 }
+            site, { mainWidth: 55 }
         ]))
     };
     let settings = { ...defaults };
@@ -49,6 +59,13 @@
     let cardMenuId = 0;
     let processTimer;
     const expandedMoreButtons = new WeakSet();
+    const attemptedCVInputs = new WeakSet();
+    const pinokisAppliedConfirmationDocuments = new WeakSet();
+    const pinokisAppliedConfirmationObservers = new WeakSet();
+    let cvDatabasePromise;
+    let preferredCVHandle;
+    let preferredCVLoaded = false;
+    let cvFillInProgress = false;
 
     const skillGroups = {
         strong: { label: 'Core languages', skills: ['Go', 'Golang', 'Java', 'Python', 'C++', 'C#', 'Rust', 'Kotlin', 'Scala', 'Ruby', 'Swift', 'Erlang', 'Elixir', 'Haskell', 'PHP', 'Objective-C'] },
@@ -95,21 +112,18 @@
         }
     }
 
-    async function loadSettings() {
-        try {
-            const stored = await GM_getValue(STORAGE_KEY, null);
-            if (stored) {
-                const saved = typeof stored === 'string' ? JSON.parse(stored) : stored;
-                settings = { ...defaults, ...saved };
-            }
-        } catch (error) {
-            console.error('Job Search Toolkit: could not load settings; using defaults.', error);
-        }
+    function normalizeSettings(candidate) {
+        const knownSettings = Object.fromEntries(Object.entries(candidate)
+            .filter(([key]) => Object.prototype.hasOwnProperty.call(defaults, key)));
+        settings = { ...defaults, ...knownSettings };
         if (!Object.values(FILTERS).includes(settings.activeFilter)) settings.activeFilter = FILTERS.SHOW_ALL;
-        for (const key of ['blockedPhrases', 'blockedEmployers', 'blockedEmployerPositions', 'blockedPositions']) {
+        for (const key of ['onlyUnviewed', 'onlyUnhidden', 'onlyUnapplied']) {
+            settings[key] = settings[key] === true;
+        }
+        for (const key of ['blockedPhrases', 'blockedEmployers', 'blockedEmployerPositions', 'blockedPositions', 'appliedJobs', 'hiddenJobs']) {
             if (!Array.isArray(settings[key])) settings[key] = [];
         }
-        for (const key of ['blockedPhrases', 'blockedEmployers', 'blockedPositions']) {
+        for (const key of ['blockedPhrases', 'blockedEmployers', 'blockedPositions', 'appliedJobs', 'hiddenJobs']) {
             settings[key] = settings[key].filter(item => typeof item === 'string' && item.trim());
         }
         settings.blockedEmployerPositions = settings.blockedEmployerPositions.filter(item =>
@@ -148,20 +162,171 @@
         settings.detailsWidth = Math.min(85, Math.max(50, Number(settings.detailsWidth) || 65));
         settings.splitViewWidths = Object.fromEntries([...splitViewSites].map(site => {
             const widths = settings.splitViewWidths?.[site] || {};
+            const oldDetailsWidth = Number(widths.detailsWidth);
+            const resultsShare = Number(widths.mainWidth) || 55;
+            const split = Number.isFinite(oldDetailsWidth) && oldDetailsWidth > 0
+                ? Math.round(resultsShare / (resultsShare + oldDetailsWidth) * 100)
+                : resultsShare;
             return [site, {
-                mainWidth: Math.min(70, Math.max(30, Number(widths.mainWidth) || 55)),
-                detailsWidth: Math.min(70, Math.max(30, Number(widths.detailsWidth) || 45))
+                mainWidth: Math.min(70, Math.max(30, split))
             }];
         }));
+        return settings;
+    }
+
+    async function loadSettings() {
+        let savedSettings = {};
+        try {
+            const stored = await GM_getValue(STORAGE_KEY, null);
+            if (stored) {
+                const saved = typeof stored === 'string' ? JSON.parse(stored) : stored;
+                if (saved && typeof saved === 'object' && !Array.isArray(saved)) savedSettings = saved;
+            }
+        } catch (error) {
+            console.error('Job Search Toolkit: could not load settings; using defaults.', error);
+        }
+        normalizeSettings(savedSettings);
     }
 
     await loadSettings();
 
+    function openCVDatabase() {
+        if (!cvDatabasePromise) {
+            cvDatabasePromise = new Promise((resolve, reject) => {
+                const request = indexedDB.open(CV_DATABASE, 1);
+                request.onupgradeneeded = () => {
+                    if (!request.result.objectStoreNames.contains(CV_STORE)) {
+                        request.result.createObjectStore(CV_STORE);
+                    }
+                };
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => {
+                    cvDatabasePromise = null;
+                    reject(request.error || new Error('Could not open preferred CV storage.'));
+                };
+            });
+        }
+        return cvDatabasePromise;
+    }
+
+    async function getPreferredCVHandle() {
+        if (preferredCVLoaded) return preferredCVHandle;
+        const database = await openCVDatabase();
+        preferredCVHandle = await new Promise((resolve, reject) => {
+            const request = database.transaction(CV_STORE).objectStore(CV_STORE).get(CV_RECORD);
+            request.onsuccess = () => resolve(request.result || null);
+            request.onerror = () => reject(request.error || new Error('Could not read the preferred CV.'));
+        });
+        preferredCVLoaded = true;
+        return preferredCVHandle;
+    }
+
+    async function savePreferredCVHandle(handle) {
+        const database = await openCVDatabase();
+        await new Promise((resolve, reject) => {
+            const transaction = database.transaction(CV_STORE, 'readwrite');
+            transaction.objectStore(CV_STORE).put(handle, CV_RECORD);
+            transaction.oncomplete = resolve;
+            transaction.onerror = () => reject(transaction.error || new Error('Could not save the preferred CV.'));
+            transaction.onabort = () => reject(transaction.error || new Error('Could not save the preferred CV.'));
+        });
+        preferredCVHandle = handle;
+        preferredCVLoaded = true;
+    }
+
+    async function removePreferredCVHandle() {
+        const database = await openCVDatabase();
+        await new Promise((resolve, reject) => {
+            const transaction = database.transaction(CV_STORE, 'readwrite');
+            transaction.objectStore(CV_STORE).delete(CV_RECORD);
+            transaction.oncomplete = resolve;
+            transaction.onerror = () => reject(transaction.error || new Error('Could not remove the preferred CV.'));
+            transaction.onabort = () => reject(transaction.error || new Error('Could not remove the preferred CV.'));
+        });
+        preferredCVHandle = null;
+        preferredCVLoaded = true;
+    }
+
+    function isSupportedCV(file) {
+        return file && /\.(pdf|docx?)$/i.test(file.name)
+            && file.size > 0 && file.size <= MAX_CV_SIZE;
+    }
+
+    function pinokisCVInput(doc = document) {
+        return doc.querySelector('form#cv-upload-form input[type="file"][accept*=".pdf"]');
+    }
+
+    function showCVPermissionButton(input) {
+        const form = input.closest('form');
+        if (!form || form.querySelector('[data-li-job-tools-cv-access]')) return;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.liJobToolsCvAccess = '';
+        button.className = 'w-full h-12 rounded-xl border border-slate-200 text-slate-700 font-semibold';
+        button.textContent = 'Allow access and attach preferred CV';
+        button.addEventListener('click', async () => {
+            try {
+                await fillPinokisCV(input, true);
+            } catch (error) {
+                console.error('Job Search Toolkit: could not access the preferred CV.', error);
+                setStatus('Could not access the preferred CV. Check browser permission.');
+            }
+        });
+        input.addEventListener('change', () => button.remove(), { once: true });
+        input.closest('label')?.after(button);
+    }
+
+    async function fillPinokisCV(input, requestPermission, report = setStatus) {
+        if (!input?.isConnected || input.files.length) return false;
+        const handle = await getPreferredCVHandle();
+        if (!handle) return false;
+        let permission = await handle.queryPermission({ mode: 'read' });
+        if (permission !== 'granted' && requestPermission) {
+            permission = await handle.requestPermission({ mode: 'read' });
+        }
+        if (permission !== 'granted') {
+            if (!requestPermission) showCVPermissionButton(input);
+            report('Allow access to the saved CV in Import/export settings, then attach it here.');
+            return false;
+        }
+        const file = await handle.getFile();
+        if (!isSupportedCV(file)) {
+            report('The preferred CV must be a non-empty PDF, DOC, or DOCX file no larger than 30 MB.');
+            return false;
+        }
+        if (!input.isConnected || input.files.length) return false;
+        const transfer = new DataTransfer();
+        transfer.items.add(file);
+        input.files = transfer.files;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.closest('form')?.querySelector('[data-li-job-tools-cv-access]')?.remove();
+        report('Preferred CV attached. Review it before submitting.');
+        return true;
+    }
+
+    async function schedulePreferredCVFill(doc = document) {
+        if (getSite() !== 'pinokis' || cvFillInProgress) return;
+        const input = pinokisCVInput(doc);
+        if (!input || input.files.length || attemptedCVInputs.has(input)) return;
+        attemptedCVInputs.add(input);
+        cvFillInProgress = true;
+        try {
+            await fillPinokisCV(input, false);
+        } catch (error) {
+            console.error('Job Search Toolkit: could not preselect the preferred CV.', error);
+            setStatus('Could not access the preferred CV. Check browser permission and settings.');
+        } finally {
+            cvFillInProgress = false;
+        }
+    }
+
     const panel = document.createElement('section');
     panel.id = 'li-job-tools-panel';
+    panel.hidden = true;
     panel.setAttribute('aria-label', 'Job search tools');
     Object.assign(panel.style, {
-        position: 'fixed', top: '52px', right: '16px', zIndex: '9999',
+        position: 'fixed', top: '52px', left: '16px', zIndex: '9999',
         display: 'flex', gap: '10px', maxWidth: 'calc(100vw - 32px)',
         height: 'calc(100vh - 68px)',         maxHeight: 'min(1000px, calc(100vh - 68px))', overflow: 'hidden',
         alignItems: 'stretch',
@@ -177,9 +342,9 @@
     toggleButton.textContent = 'Job tools';
     toggleButton.setAttribute('aria-label', 'Toggle job search tools');
     toggleButton.setAttribute('aria-controls', panel.id);
-    toggleButton.setAttribute('aria-expanded', 'true');
+    toggleButton.setAttribute('aria-expanded', 'false');
     Object.assign(toggleButton.style, {
-        position: 'fixed', top: '10px', right: '16px', zIndex: '10003',
+        position: 'fixed', top: '10px', left: '16px', zIndex: '10003',
         padding: '7px 10px', border: '1px solid #767676', borderRadius: '6px',
         background: '#fff', color: '#202124', cursor: 'pointer'
     });
@@ -230,13 +395,109 @@
         .li-tools-filtered-out { display: none !important; }
         .li-tools-menu { padding: 8px; border-top: 1px solid #b7b7b7; }
         .li-tools-menu button { display: block; width: 100%; margin-top: 4px; padding: 7px; border: 1px solid #767676; border-radius: 4px; background: #fff; color: #202124; text-align: left; }
-        .li-tools-card-actions { position: relative !important; z-index: 10003 !important; overflow: visible !important; }
+        #li-tools-block-value-dialog { box-sizing: border-box; width: 28rem; max-width: calc(100vw - 2rem); padding: 16px; border: 1px solid #767676; border-radius: 8px; background: #fff; color: #202124; }
+        #li-tools-block-value-dialog::backdrop { background: rgb(0 0 0 / 35%); }
+        #li-tools-block-value-dialog h2 { margin: 0 0 12px; font-size: 1.2rem; }
+        #li-tools-block-value-dialog label { display: block; margin-bottom: 4px; color: #202124 !important; }
+        #li-tools-block-value-dialog input {
+            box-sizing: border-box !important;
+            width: 100% !important;
+            min-width: 0 !important;
+            min-height: 40px;
+            padding: 8px !important;
+            border: 1px solid #5f6368 !important;
+            border-radius: 4px !important;
+            background: #fff !important;
+            color: #202124 !important;
+            font: inherit !important;
+        }
+        #li-tools-block-value-dialog button { min-height: 40px; padding: 6px 10px; border: 1px solid #5f6368 !important; border-radius: 4px; background: #fff !important; color: #202124 !important; font: inherit; cursor: pointer; }
+        #li-tools-block-value-dialog button:hover { background: #f0f0f0 !important; }
+        #li-tools-block-value-dialog button:focus-visible, #li-tools-block-value-dialog input:focus-visible { outline: 3px solid #075a9c; outline-offset: 2px; }
+        #li-tools-block-value-dialog form > div { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+        #li-tools-settings-dialog { box-sizing: border-box; width: 42rem; max-width: calc(100vw - 2rem); max-height: calc(100vh - 2rem); overflow: auto; padding: 16px; border: 1px solid #767676; border-radius: 8px; background: #fff; color: #202124; }
+        #li-tools-settings-dialog::backdrop { background: rgb(0 0 0 / 35%); }
+        #li-tools-settings-dialog h2 { margin: 0 0 12px; font-size: 1.2rem; }
+        #li-tools-settings-dialog textarea { display: block; box-sizing: border-box; width: 100%; min-height: 16rem; max-height: 55vh; resize: vertical; padding: 8px; border: 1px solid #5f6368; border-radius: 4px; background: #fff; color: #202124; font: 13px monospace; overflow-wrap: anywhere; }
+        #li-tools-settings-dialog input { max-width: 100%; font: inherit; }
+        #li-tools-settings-dialog input[type=file] { display: block; width: 100%; min-height: 40px; margin-top: 6px; }
+        #li-tools-settings-dialog button { min-height: 40px; padding: 6px 10px; border: 1px solid #5f6368; border-radius: 4px; background: #fff; color: #202124; font: inherit; cursor: pointer; }
+        #li-tools-settings-dialog button:hover { background: #f0f0f0; }
+        #li-tools-settings-dialog button:focus-visible, #li-tools-settings-dialog input:focus-visible,
+        #li-tools-settings-dialog textarea:focus-visible { outline: 3px solid #075a9c; outline-offset: 2px; }
+        #li-tools-settings-dialog [data-settings-actions] { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+        @media (forced-colors: active) {
+            #li-tools-block-value-dialog { border-color: CanvasText; background: Canvas; color: CanvasText; }
+            #li-tools-block-value-dialog::backdrop { background: Canvas; }
+            #li-tools-block-value-dialog label, #li-tools-block-value-dialog input,
+            #li-tools-block-value-dialog button {
+                border-color: ButtonBorder !important;
+                background: Canvas !important;
+                color: CanvasText !important;
+            }
+            #li-tools-block-value-dialog button:focus-visible,
+            #li-tools-block-value-dialog input:focus-visible { outline-color: Highlight; }
+            #li-tools-settings-dialog { border-color: CanvasText; background: Canvas; color: CanvasText; }
+            #li-tools-settings-dialog::backdrop { background: Canvas; }
+            #li-tools-settings-dialog button, #li-tools-settings-dialog input, #li-tools-settings-dialog textarea {
+                border-color: ButtonBorder;
+                background: Canvas;
+                color: CanvasText;
+            }
+            #li-tools-settings-dialog button:focus-visible,
+            #li-tools-settings-dialog input:focus-visible,
+            #li-tools-settings-dialog textarea:focus-visible { outline-color: Highlight; }
+        }
+        .li-tools-card-actions { position: relative !important; z-index: 9999 !important; overflow: visible !important; }
         .li-tools-card-container { position: relative !important; overflow: visible !important; }
-        .li-tools-card-actions-floating { position: absolute !important; top: 4px !important; right: 4px !important; }
+        .li-tools-card-actions-floating { position: absolute !important; top: 4px !important; right: 4px !important; display: flex; align-items: center; gap: 4px; }
+        .li-tools-applied-checkbox {
+            appearance: none !important;
+            display: grid;
+            place-items: center;
+            box-sizing: border-box;
+            width: 32px;
+            height: 32px;
+            margin: 0;
+            border: 0 !important;
+            background: transparent !important;
+            cursor: pointer;
+        }
+        .li-tools-applied-checkbox::after {
+            content: '✅';
+            font-size: 20px;
+            filter: grayscale(1);
+        }
+        .li-tools-applied-checkbox:checked::after { filter: grayscale(0); }
+        .li-tools-applied-checkbox:focus-visible { outline: 3px solid #075a9c; outline-offset: 2px; }
+        .li-tools-hidden-checkbox {
+            appearance: none !important;
+            position: relative;
+            display: grid;
+            place-items: center;
+            box-sizing: border-box;
+            width: 32px;
+            height: 32px;
+            margin: 0;
+            border: 0 !important;
+            background: transparent !important;
+            cursor: pointer;
+        }
+        .li-tools-hidden-checkbox::before { content: '👁️'; filter: grayscale(1); font-size: 20px; }
+        .li-tools-hidden-checkbox:checked::after {
+            position: absolute;
+            content: '/';
+            color: #767676;
+            font-size: 25px;
+            font-weight: 700;
+            line-height: 1;
+            transform: rotate(15deg);
+        }
+        .li-tools-hidden-checkbox:focus-visible { outline: 3px solid #075a9c; outline-offset: 2px; }
         .li-tools-card-actions-floating > .li-tools-card-trigger { padding: 4px 8px; border: 1px solid #767676; border-radius: 4px; background: #fff; color: #202124; line-height: 1; }
-        .li-tools-card-open { position: relative !important; z-index: 10002 !important; }
+        .li-tools-card-open { position: relative !important; z-index: 100000 !important; }
         .li-tools-card-trigger { min-width: 32px; min-height: 32px; }
-        .li-tools-card-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 10004; width: 240px; padding: 8px; border: 1px solid #767676; border-radius: 6px; background: #fff; color: #202124; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+        .li-tools-card-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 100002; width: 240px; padding: 8px; border: 1px solid #767676; border-radius: 6px; background: #fff; color: #202124; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
         .li-tools-card-menu[hidden] { display: none !important; }
         .li-tools-card-menu button:focus-visible { outline: 3px solid #111; outline-offset: 2px; }
         #li-tools-job-preview {
@@ -255,7 +516,14 @@
         }
         #li-tools-job-preview[hidden] { display: none !important; }
         #li-tools-job-preview-header { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 10px 14px; border-bottom: 1px solid #b7b7b7; }
-        #li-tools-job-preview-title { flex: 1 1 auto; min-width: 0; margin: 0; font-size: 16px; }
+        #li-tools-job-preview-title { display: flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; margin: 0; font-size: 16px; }
+        .li-tools-title-pill, .li-tools-title-label { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 4px 8px; overflow-wrap: anywhere; border: 1px solid #767676; border-radius: 999px; background: #f5f5f5; color: #202124; font-size: 13px; font-weight: 500; user-select: text; -webkit-user-select: text; }
+        .li-tools-title-pill { font: inherit; font-size: 13px; cursor: context-menu; }
+        .li-tools-title-icon { flex: 0 0 16px; width: 16px; height: 16px; fill: currentColor; }
+        .li-tools-title-pill:focus-visible { outline: 3px solid #111; outline-offset: 2px; }
+        .li-tools-title-menu { position: fixed; z-index: 10010; min-width: 180px; padding: 6px; border: 1px solid #767676; border-radius: 6px; background: #fff; color: #202124; box-shadow: 0 2px 8px rgba(0,0,0,.2); }
+        .li-tools-title-menu button { display: block; width: 100%; padding: 7px; border: 0; background: #fff; color: #202124; text-align: left; cursor: pointer; }
+        .li-tools-title-menu button:focus-visible { outline: 3px solid #111; outline-offset: -2px; }
         #li-tools-job-preview-close { flex: 0 0 auto; padding: 6px 10px; border: 1px solid #767676; border-radius: 4px; background: #fff; color: #202124; }
         #li-tools-job-preview-frame { width: 100%; height: 100%; border: 0; background: #fff; }
         .li-tools-job-selected { outline: 3px solid #075a9c !important; outline-offset: -3px !important; }
@@ -287,6 +555,7 @@
                 max-width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
                 margin: 0 !important;
             }
+            body.li-tools-split-view[data-li-tools-site="cvonline"] .top-banner { display: none !important; }
             body.li-tools-split-view[data-li-tools-site="cvonline"] .search,
             body.li-tools-split-view[data-li-tools-site="cvonline"] .search__content { width: 100% !important; min-width: 0 !important; }
             body.li-tools-split-view[data-li-tools-site="cvonline"] .vacancies-list { width: 100% !important; min-width: 0 !important; }
@@ -308,6 +577,12 @@
                 margin-left: 0 !important;
                 margin-right: 0 !important;
             }
+            @media (min-width: 1024px) {
+                body.li-tools-split-view[data-li-tools-site="cvlt"] > div[class~="lg:container"][class~="pt-7"] {
+                    padding-right: 2rem !important;
+                    padding-left: 1rem !important;
+                }
+            }
             body.li-tools-split-view[data-li-tools-site="cvlt"] > div[class~="lg:container"][class~="pt-7"] > main {
                 flex: 1 1 auto !important;
                 width: auto !important;
@@ -318,6 +593,24 @@
                 min-width: 0 !important;
             }
             body.li-tools-split-view[data-li-tools-site="cvlt"] .jobs-list { width: 100% !important; min-width: 0 !important; }
+            body.li-tools-split-view[data-li-tools-site="pinokis"] #main {
+                box-sizing: border-box !important;
+                width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
+                max-width: min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) !important;
+                padding-left: 0 !important;
+            }
+            body.li-tools-split-view[data-li-tools-site="pinokis"] #main > .wrapper,
+            body.li-tools-split-view[data-li-tools-site="pinokis"] #content,
+            body.li-tools-split-view[data-li-tools-site="pinokis"] #content .jobs-bg,
+            body.li-tools-split-view[data-li-tools-site="pinokis"] #content .jobs-bg > .max-w-6xl {
+                width: 100% !important;
+                max-width: none !important;
+                margin-left: 0 !important;
+                margin-right: 0 !important;
+            }
+            body.li-tools-split-view[data-li-tools-site="pinokis"] #main > .wrapper > aside {
+                display: none !important;
+            }
             body.li-tools-split-view[data-li-tools-site="uzt"] app-public-job-vacancy-search {
                 flex: 0 0 calc(min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) - 32px) !important;
                 width: calc(min(var(--li-tools-results-width, 55vw), calc(100vw - var(--li-tools-preview-width, 45vw))) - 32px) !important;
@@ -362,14 +655,27 @@
             }
         }
         @media (max-width: 700px) {
-            #li-job-tools-panel:not([hidden]) { width: calc(100vw - 16px); height: calc(100vh - 58px); max-height: min(1000px, calc(100vh - 58px)); right: 8px; top: 50px; flex-direction: column; }
+            #li-job-tools-panel:not([hidden]) { width: calc(100vw - 16px); height: calc(100vh - 58px); max-height: min(1000px, calc(100vh - 58px)); left: 8px; top: 50px; flex-direction: column; }
             .li-tools-column { min-width: 0; }
             #li-tools-editor { flex: 0 1 auto; width: 100%; }
             #li-tools-editor > .li-tools-section:not([hidden]) { flex: 1 1 auto; }
         }
         @media (forced-colors: active) {
             #li-job-tools-panel, #li-job-tools-panel button, #li-job-tools-panel input,
-            .li-tools-menu button, .li-tools-card-menu, .li-tools-card-trigger { border-color: ButtonBorder; background: Canvas; color: CanvasText; }
+            .li-tools-menu button, .li-tools-card-menu, .li-tools-card-trigger,
+            .li-tools-applied-checkbox, .li-tools-hidden-checkbox,
+            .li-tools-title-pill, .li-tools-title-label, .li-tools-title-menu, .li-tools-title-menu button {
+                border-color: ButtonBorder; background: Canvas; color: CanvasText;
+            }
+            .li-tools-applied-checkbox, .li-tools-hidden-checkbox {
+                appearance: none !important;
+                border: 0 !important;
+                background: transparent !important;
+            }
+            .li-tools-applied-checkbox::after { filter: grayscale(1); }
+            .li-tools-applied-checkbox:checked::after { filter: grayscale(0); }
+            .li-tools-hidden-checkbox::before { filter: grayscale(1); }
+            .li-tools-hidden-checkbox:checked::after { color: GrayText; }
             .li-tools-skill, .li-tools-salary-above, .li-tools-salary-below {
                 background: Canvas !important; color: CanvasText !important; outline: 1px solid CanvasText;
             }
@@ -462,10 +768,21 @@
             row.appendChild(control);
             return control;
         });
+        let savedValues = inputs.map(input => input.value);
+        let saving;
+        async function saveRow() {
+            const values = inputs.map(input => input.value);
+            if (values.every((value, index) => value === savedValues[index])) return;
+            if (saving) await saving;
+            if (values.every((value, index) => value === savedValues[index])) return;
+            saving = onSave(values);
+            if (await saving) savedValues = values;
+            saving = null;
+        }
         const actions = document.createElement('div');
         actions.className = 'li-tools-row-actions';
         const description = fields.filter(field => field.type !== 'color').map(field => field.value).join(' + ');
-        const saveButton = makeButton('', () => onSave(inputs.map(input => input.value)), 'li-tools-secondary li-tools-icon-button');
+        const saveButton = makeButton('', saveRow, 'li-tools-secondary li-tools-icon-button');
         setButtonIcon(saveButton, 'M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z');
         const updateLabels = () => {
             const current = inputs.filter(input => input.type !== 'color').map(input => input.value).join(' + ') || description || 'list item';
@@ -480,6 +797,9 @@
         inputs.forEach(input => input.addEventListener('input', updateLabels));
         actions.append(saveButton, removeButton);
         row.appendChild(actions);
+        row.addEventListener('focusout', event => {
+            if (!row.contains(event.relatedTarget)) saveRow();
+        });
         list.appendChild(row);
     }
 
@@ -573,6 +893,7 @@
             button.setAttribute('aria-controls', leftColumn.id || 'li-tools-editor');
             listNavigation.appendChild(button);
         }
+        listNavigation.appendChild(makeButton('Import/export', openSettingsDialog, 'li-tools-secondary'));
         return listNavigation;
     }
     leftColumn.id = 'li-tools-editor';
@@ -611,6 +932,7 @@
         applyFilter();
     }));
 
+    const filterToggleButtons = new Map();
     function addToggle(label, key) {
         const button = makeButton(`${label}: ${settings[key] ? 'On' : 'Off'}`, async target => {
             hideEditor();
@@ -619,6 +941,7 @@
             await saveSettings();
             applyFilter();
         });
+        filterToggleButtons.set(key, { label, button });
         filterSection.appendChild(button);
     }
     addToggle('Only unviewed', 'onlyUnviewed');
@@ -650,6 +973,7 @@
     const splitLayout = splitViewSites.has(layoutSite);
     const layoutSettings = splitLayout ? settings.splitViewWidths[layoutSite] : settings;
     layoutSection.hidden = !splitLayout && layoutSite !== 'linkedin';
+    const layoutControls = new Map();
     function addRange(labelText, key, min, max, suffix) {
         const label = document.createElement('label');
         label.className = 'li-tools-field';
@@ -662,10 +986,12 @@
         input.value = String(layoutSettings[key]);
         input.setAttribute('aria-label', labelText);
         const update = () => {
-            layoutSettings[key] = Number(input.value);
-            text.textContent = `${labelText}: ${layoutSettings[key]}${suffix}`;
+            const currentLayoutSettings = splitLayout ? settings.splitViewWidths[layoutSite] : settings;
+            currentLayoutSettings[key] = Number(input.value);
+            text.textContent = `${labelText}: ${currentLayoutSettings[key]}${suffix}`;
             updateLayout();
         };
+        layoutControls.set(key, { input, text, labelText, suffix });
         input.addEventListener('input', update);
         input.addEventListener('change', async () => {
             await saveSettings();
@@ -674,19 +1000,240 @@
         layoutSection.appendChild(label);
         update();
     }
-    addRange(splitLayout ? 'Results pane width' : 'Main content width', 'mainWidth',
+    addRange(splitLayout ? 'Results pane share' : 'Main content width', 'mainWidth',
         splitLayout ? 30 : 70, splitLayout ? 70 : 140, '%');
-    addRange('Details pane width', 'detailsWidth', splitLayout ? 30 : 50, splitLayout ? 70 : 85, '%');
+    if (!splitLayout) addRange('Details pane width', 'detailsWidth', 50, 85, '%');
     rightColumn.appendChild(layoutSection);
 
     rightColumn.appendChild(status);
+
+    function openSettingsDialog(trigger) {
+        const dialog = document.createElement('dialog');
+        dialog.id = 'li-tools-settings-dialog';
+        dialog.setAttribute('aria-labelledby', 'li-tools-settings-title');
+        const title = document.createElement('h2');
+        title.id = 'li-tools-settings-title';
+        title.textContent = 'Import/export settings';
+        const modeButtons = document.createElement('div');
+        modeButtons.setAttribute('data-settings-actions', '');
+        const importMode = document.createElement('button');
+        importMode.type = 'button';
+        importMode.textContent = 'Import';
+        const exportMode = document.createElement('button');
+        exportMode.type = 'button';
+        exportMode.textContent = 'Export';
+        modeButtons.append(importMode, exportMode);
+        const cvSection = document.createElement('section');
+        const cvTitle = document.createElement('h3');
+        cvTitle.textContent = 'Preferred CV for Pinokis';
+        const cvDescription = document.createElement('p');
+        cvDescription.id = 'li-tools-preferred-cv-description';
+        cvDescription.textContent = 'The file stays in its original location. A file handle is stored on Pinokis.com and may be used by page scripts when browser permission is granted. It is not included in settings JSON.';
+        const cvStatus = document.createElement('div');
+        cvStatus.setAttribute('role', 'status');
+        cvStatus.setAttribute('aria-live', 'polite');
+        cvStatus.style.minHeight = '1em';
+        const chooseCV = makeButton('Choose and remember CV', async () => {
+            let handle;
+            try {
+                const pickerWindow = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+                [handle] = await pickerWindow.showOpenFilePicker.call(pickerWindow, {
+                    multiple: false,
+                    types: [{
+                        description: 'CV document',
+                        accept: {
+                            'application/pdf': ['.pdf'],
+                            'application/msword': ['.doc'],
+                            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx']
+                        }
+                    }]
+                });
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    cvStatus.textContent = 'File selection canceled.';
+                    return;
+                }
+                console.error('Job Search Toolkit: preferred CV picker failed.', error);
+                cvStatus.textContent = `Browser could not open its persistent file picker (${error.name || 'error'}: ${error.message || 'no details'}).`;
+                return;
+            }
+            try {
+                const file = await handle.getFile();
+                if (!isSupportedCV(file)) {
+                    cvStatus.textContent = 'Choose a non-empty PDF, DOC, or DOCX file no larger than 30 MB.';
+                    return;
+                }
+                await savePreferredCVHandle(handle);
+                cvStatus.textContent = `Preferred CV saved: ${handle.name}.`;
+                forgetCV.hidden = false;
+                useCV.hidden = false;
+                const input = pinokisCVInput(jobPreviewFrame?.contentDocument) || pinokisCVInput();
+                if (input) await fillPinokisCV(input, true, message => { cvStatus.textContent = message; });
+            } catch (error) {
+                console.error('Job Search Toolkit: could not save or access the preferred CV handle.', error);
+                cvStatus.textContent = `Could not remember or access the selected CV (${error.name || 'error'}: ${error.message || 'no details'}).`;
+            }
+        });
+        const useCV = makeButton('Grant access and attach saved CV', async () => {
+            const input = pinokisCVInput(jobPreviewFrame?.contentDocument) || pinokisCVInput();
+            if (!input) {
+                cvStatus.textContent = 'Select a Pinokis vacancy with a CV upload field, then try again.';
+                return;
+            }
+            try {
+                await fillPinokisCV(input, true, message => { cvStatus.textContent = message; });
+            } catch (error) {
+                console.error('Job Search Toolkit: could not attach the preferred CV.', error);
+                cvStatus.textContent = 'Could not access the preferred CV. Check browser permission.';
+            }
+        });
+        const forgetCV = makeButton('Forget preferred CV', async () => {
+            try {
+                await removePreferredCVHandle();
+                cvStatus.textContent = 'Preferred CV forgotten.';
+                forgetCV.hidden = true;
+                useCV.hidden = true;
+            } catch (error) {
+                console.error('Job Search Toolkit: could not forget the preferred CV.', error);
+                cvStatus.textContent = 'Could not remove the preferred CV. Check browser storage.';
+            }
+        });
+        const onPinokis = getSite() === 'pinokis';
+        chooseCV.hidden = !onPinokis;
+        useCV.hidden = true;
+        forgetCV.hidden = true;
+        cvSection.append(cvTitle, cvDescription, chooseCV, useCV, forgetCV, cvStatus);
+
+        const fieldLabel = document.createElement('label');
+        fieldLabel.htmlFor = 'li-tools-settings-json';
+        const field = document.createElement('textarea');
+        field.id = fieldLabel.htmlFor;
+        field.spellcheck = false;
+        const actions = document.createElement('div');
+        actions.setAttribute('data-settings-actions', '');
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.textContent = 'Close';
+        close.addEventListener('click', () => dialog.close());
+        const submit = document.createElement('button');
+        submit.type = 'submit';
+        submit.textContent = 'Import';
+        actions.append(close, submit);
+        const form = document.createElement('form');
+        const message = document.createElement('div');
+        message.setAttribute('role', 'status');
+        message.setAttribute('aria-live', 'polite');
+        message.style.minHeight = '1em';
+        form.append(fieldLabel, field, message, actions);
+        dialog.append(title, modeButtons, cvSection, form);
+
+        if (!onPinokis) {
+            cvDescription.textContent = 'Open Pinokis.com to choose a preferred CV. The file stays in its original location and is not included in settings JSON.';
+        } else {
+            getPreferredCVHandle().then(handle => {
+                if (!dialog.isConnected) return;
+                if (handle) {
+                    cvStatus.textContent = `Preferred CV saved: ${handle.name}.`;
+                    forgetCV.hidden = false;
+                    useCV.hidden = false;
+                    useCV.textContent = 'Grant access if needed and attach saved CV';
+                } else {
+                    cvStatus.textContent = 'No preferred CV selected.';
+                }
+            }).catch(error => {
+                console.error('Job Search Toolkit: could not load the preferred CV.', error);
+                cvStatus.textContent = 'Could not read the preferred CV setting. Check browser storage.';
+            });
+        }
+
+        function setMode(mode) {
+            const exporting = mode === 'export';
+            fieldLabel.textContent = exporting ? 'Settings JSON (click to select and copy)' : 'Settings JSON to import';
+            field.placeholder = exporting ? '' : 'Paste settings JSON here';
+            field.readOnly = exporting;
+            field.value = exporting ? JSON.stringify(settings, null, 2) : '';
+            submit.hidden = exporting;
+            message.textContent = '';
+            if (exporting) {
+                field.focus();
+                field.select();
+                if (navigator.clipboard?.writeText) {
+                    navigator.clipboard.writeText(field.value).then(
+                        () => { message.textContent = 'Settings JSON copied to clipboard.'; },
+                        error => {
+                            console.warn('Job Search Toolkit: could not copy exported settings.', error);
+                            message.textContent = 'JSON selected, but clipboard access failed. Copy it manually.';
+                        }
+                    );
+                } else {
+                    message.textContent = 'JSON selected. Clipboard access is unavailable; copy it manually.';
+                }
+            } else {
+                field.focus();
+            }
+        }
+
+        importMode.addEventListener('click', () => setMode('import'));
+        exportMode.addEventListener('click', () => setMode('export'));
+        field.addEventListener('click', () => {
+            if (field.readOnly) setMode('export');
+        });
+        form.addEventListener('submit', async event => {
+            event.preventDefault();
+            if (field.value.length > 5_000_000) {
+                message.textContent = 'Settings JSON is too large to import.';
+                field.focus();
+                return;
+            }
+            let imported;
+            try {
+                imported = JSON.parse(field.value);
+            } catch (error) {
+                message.textContent = `Invalid JSON: ${error.message}`;
+                field.focus();
+                return;
+            }
+            if (!imported || typeof imported !== 'object' || Array.isArray(imported)) {
+                message.textContent = 'Settings JSON must be an object.';
+                field.focus();
+                return;
+            }
+            const previous = settings;
+            normalizeSettings(imported);
+            if (!await saveSettings()) {
+                settings = previous;
+                message.textContent = 'Could not save imported settings. Existing settings were kept.';
+                return;
+            }
+            skillToggle.checked = settings.skillsEnabled;
+            salaryInput.value = String(settings.salaryMinimum);
+            filterToggleButtons.forEach(({ label, button }, key) => {
+                button.textContent = `${label}: ${settings[key] ? 'On' : 'Off'}`;
+            });
+            layoutControls.forEach(({ input, text, labelText, suffix }, key) => {
+                const currentLayoutSettings = splitLayout ? settings.splitViewWidths[layoutSite] : settings;
+                input.value = String(currentLayoutSettings[key]);
+                text.textContent = `${labelText}: ${currentLayoutSettings[key]}${suffix}`;
+            });
+            renderBlockedLists();
+            processPage();
+            message.textContent = 'Settings imported and saved.';
+        });
+        dialog.addEventListener('close', () => {
+            dialog.remove();
+            trigger.focus();
+        }, { once: true });
+        document.body.appendChild(dialog);
+        dialog.showModal();
+        setMode('import');
+    }
 
     function updateLayout() {
         const site = getSite();
         if (splitViewSites.has(site)) {
             const widths = settings.splitViewWidths[site];
             document.documentElement.style.setProperty('--li-tools-results-width', `${widths.mainWidth}vw`);
-            document.documentElement.style.setProperty('--li-tools-preview-width', `${widths.detailsWidth}vw`);
+            document.documentElement.style.setProperty('--li-tools-preview-width', `${100 - widths.mainWidth}vw`);
         } else {
             document.documentElement.style.setProperty('--li-tools-main-width', `${settings.mainWidth}vw`);
             document.documentElement.style.setProperty('--li-tools-details-width', `${settings.detailsWidth}%`);
@@ -723,6 +1270,7 @@
         if (hostname === 'cvonline.lt' || hostname.endsWith('.cvonline.lt')) return 'cvonline';
         if (hostname === 'cvmarket.lt' || hostname.endsWith('.cvmarket.lt')) return 'cvmarket';
         if (hostname === 'cv.lt' || hostname.endsWith('.cv.lt')) return 'cvlt';
+        if (hostname === 'pinokis.com' || hostname.endsWith('.pinokis.com')) return 'pinokis';
         if (hostname === 'jobs.workinlithuania.com') return 'workinlithuania';
         if (hostname === 'uzt.lt') return 'uzt';
         return '';
@@ -756,6 +1304,14 @@
             return {
                 position: card.querySelector('.job-title')?.innerText.trim() || '',
                 company: card.querySelector('.job-company')?.innerText.trim() || ''
+            };
+        }
+        if (site === 'pinokis') {
+            return {
+                position: card.querySelector('h2 a[href*="/darbo-skelbimai/"]')?.innerText.trim() || '',
+                company: card.querySelector('a[href*="/atsiliepimai/imone/"]')?.innerText.trim()
+                    || card.querySelector('img[alt*="logotipas" i]')?.alt.replace(/\s+logotipas$/i, '').trim()
+                    || ''
             };
         }
         if (site === 'workinlithuania') {
@@ -821,16 +1377,17 @@
         const entry = makeListEntry(key, values);
         if (values.some(value => !value.trim())) {
             setStatus('Enter a value for every field.');
-            return;
+            return false;
         }
         if (settings[key].some((item, itemIndex) => itemIndex !== index && sameListEntry(key, item, entry))) {
             setStatus('That item is already in the list.');
-            return;
+            return false;
         }
         settings[key][index] = entry;
         const saved = await saveSettings();
         applyFilter();
         setStatus(saved ? 'List item updated.' : 'Could not save settings. Check the console.');
+        return saved;
     }
 
     async function removeListEntry(key, index) {
@@ -912,16 +1469,17 @@
         const color = values[1];
         if (!name || !/^#[\da-f]{6}$/i.test(color)) {
             setStatus('Enter a skill and choose a valid highlight color.');
-            return;
+            return false;
         }
         if (settings.skills.some((skill, skillIndex) => skillIndex !== index && normalized(skill.name) === normalized(name))) {
             setStatus('That skill is already in the list.');
-            return;
+            return false;
         }
         settings.skills[index] = { ...settings.skills[index], name, color };
         const saved = await saveSettings();
         processPage();
         setStatus(saved ? 'Skill updated.' : 'Could not save settings. Check the console.');
+        return saved;
     }
 
     async function removeSkill(index) {
@@ -991,6 +1549,10 @@
             return Array.from(document.querySelectorAll('.jobs-list > article[data-component="jobad"]'))
                 .filter(card => card.querySelector('.job-title'));
         }
+        if (site === 'pinokis') {
+            return Array.from(document.querySelectorAll('.jobs-bg article'))
+                .filter(card => card.querySelector('h2 a[href*="/darbo-skelbimai/"]'));
+        }
         if (site === 'workinlithuania') {
             return Array.from(document.querySelectorAll('a[href]'))
                 .filter(link => /view job/i.test(link.innerText) && link.querySelector('button'))
@@ -1011,14 +1573,154 @@
     let jobPreviewTitle;
     let jobPreviewFrame;
     let selectedJobUrl = '';
+    let autoPaginationTimer;
+    const attemptedPaginationPages = new Set();
     const previewObservers = new WeakMap();
     const previewLinkObservers = new WeakMap();
+    const previewDescriptionFrames = new WeakSet();
+    const skillContextMenuDocuments = new WeakSet();
+    const skillContextMenuFrames = new WeakSet();
+
+    function addSkillSelectionMenu(doc, root) {
+        if (skillContextMenuDocuments.has(doc)) return;
+        skillContextMenuDocuments.add(doc);
+        doc.addEventListener('contextmenu', event => {
+            const selection = doc.defaultView.getSelection();
+            const name = selection?.toString().trim();
+            const anchor = selection?.anchorNode;
+            if (!name || !anchor || !(anchor === root || root.contains(anchor.nodeType === 1 ? anchor : anchor.parentElement))) return;
+            event.preventDefault();
+            doc.querySelector('.li-tools-skill-context')?.remove();
+
+            const menu = doc.createElement('form');
+            menu.className = 'li-tools-skill-context';
+            menu.dataset.liJobTools = '1';
+            menu.setAttribute('aria-label', `Add ${name} to skills`);
+            if (!doc.getElementById('li-job-tools-skill-context-style')) {
+                const style = doc.createElement('style');
+                style.id = 'li-job-tools-skill-context-style';
+                style.textContent = `
+                    .li-tools-skill-context button:focus-visible,
+                    .li-tools-skill-context input:focus-visible { outline: 3px solid #075a9c; outline-offset: 2px; }
+                    .li-tools-skill-context button[aria-pressed="true"] { outline: 2px solid #202124; outline-offset: 2px; }
+                    @media (forced-colors: active) {
+                        .li-tools-skill-context, .li-tools-skill-context button,
+                        .li-tools-skill-context input { border-color: ButtonBorder !important; background: Canvas !important; color: CanvasText !important; }
+                        .li-tools-skill-context button:focus-visible,
+                        .li-tools-skill-context input:focus-visible,
+                        .li-tools-skill-context button[aria-pressed="true"] { outline-color: Highlight; }
+                    }
+                `;
+                doc.head.appendChild(style);
+            }
+            Object.assign(menu.style, {
+                position: 'fixed', zIndex: '2147483647', display: 'flex', alignItems: 'end',
+                flexWrap: 'wrap', maxWidth: 'calc(100vw - 16px)', gap: '8px', padding: '10px', border: '1px solid #5f6368', borderRadius: '6px',
+                background: '#fff', color: '#202124', boxShadow: '0 2px 8px rgba(0,0,0,.2)'
+            });
+            const colorLabel = doc.createElement('label');
+            colorLabel.textContent = 'Highlight color';
+            Object.assign(colorLabel.style, { display: 'grid', gap: '4px', font: '14px sans-serif' });
+            const color = doc.createElement('input');
+            color.type = 'color';
+            color.value = '#fff2b3';
+            color.setAttribute('aria-label', 'Highlight color');
+            colorLabel.appendChild(color);
+            const quickColors = doc.createElement('div');
+            Object.assign(quickColors.style, {
+                display: 'flex', flexWrap: 'wrap', gap: '4px', maxWidth: '190px'
+            });
+            const palette = [
+                ['Green', '#00ff00'],
+                ['Red', '#ff0000'],
+                ['Yellow', '#ffff00'],
+                ['Pink', '#ff00ff'],
+                ['Light blue', '#d7efff'],
+                ['Light yellow', '#fff8cc']
+            ];
+            const swatches = palette.map(([label, value]) => {
+                const button = doc.createElement('button');
+                button.type = 'button';
+                button.setAttribute('aria-label', label);
+                button.setAttribute('aria-pressed', String(color.value === value));
+                Object.assign(button.style, {
+                    width: '30px', height: '30px', padding: '0', border: '1px solid #5f6368',
+                    borderRadius: '4px', background: value, cursor: 'pointer'
+                });
+                button.addEventListener('click', () => {
+                    color.value = value;
+                    swatches.forEach(swatch => swatch.setAttribute('aria-pressed', String(swatch === button)));
+                });
+                quickColors.appendChild(button);
+                return button;
+            });
+            color.addEventListener('input', () => {
+                swatches.forEach((swatch, index) => {
+                    swatch.setAttribute('aria-pressed', String(palette[index][1] === color.value));
+                });
+            });
+            const save = doc.createElement('button');
+            save.type = 'submit';
+            save.textContent = 'Save skill';
+            Object.assign(save.style, {
+                minHeight: '36px', padding: '6px 10px', border: '1px solid #075a9c',
+                borderRadius: '4px', background: '#075a9c', color: '#fff', font: '14px sans-serif',
+                cursor: 'pointer', outlineOffset: '2px'
+            });
+            menu.append(colorLabel, quickColors, save);
+            const closeMenu = () => {
+                menu.remove();
+                doc.removeEventListener('pointerdown', closeOnOutside, true);
+            };
+            const closeOnOutside = pointerEvent => {
+                if (!menu.contains(pointerEvent.target)) closeMenu();
+            };
+            menu.addEventListener('submit', async submitEvent => {
+                submitEvent.preventDefault();
+                if (await addSkill([name, color.value], 'custom')) closeMenu();
+            });
+            doc.body.appendChild(menu);
+            const bounds = menu.getBoundingClientRect();
+            menu.style.left = `${Math.max(8, Math.min(event.clientX, doc.documentElement.clientWidth - bounds.width - 8))}px`;
+            menu.style.top = `${Math.max(8, Math.min(event.clientY, doc.documentElement.clientHeight - bounds.height - 8))}px`;
+            color.focus();
+            menu.addEventListener('keydown', keyEvent => {
+                if (keyEvent.key === 'Escape') closeMenu();
+            });
+            doc.addEventListener('pointerdown', closeOnOutside, true);
+        });
+        const addFrameMenu = frame => {
+            if (!skillContextMenuFrames.has(frame)) {
+                frame.addEventListener('load', () => {
+                    try {
+                        const frameDoc = frame.contentDocument;
+                        if (frameDoc?.body) addSkillSelectionMenu(frameDoc, frameDoc.body);
+                    } catch (error) {
+                        if (error?.name !== 'SecurityError') {
+                            console.warn('Job Search Toolkit: could not access a vacancy details frame.', error);
+                        }
+                    }
+                });
+                skillContextMenuFrames.add(frame);
+            }
+            try {
+                const frameDoc = frame.contentDocument;
+                if (frameDoc?.body) addSkillSelectionMenu(frameDoc, frameDoc.body);
+            } catch (error) {
+                if (error?.name !== 'SecurityError') {
+                    console.warn('Job Search Toolkit: could not access a vacancy details frame.', error);
+                }
+            }
+        };
+        root.querySelectorAll('iframe, frame').forEach(addFrameMenu);
+    }
 
     function getJobPreviewDetails(doc, site) {
         if (site === 'cvbankas') return doc.querySelector('#jobad_content_main');
         if (site === 'cvonline') return doc.querySelector('.vacancy-content');
         if (site === 'cvmarket') return doc.querySelector('body > div[class~="lg:container"]');
         if (site === 'cvlt') return doc.querySelector('body > div[class~="lg:container"][class~="pt-6"] main');
+        if (site === 'pinokis') return doc.querySelector('#content .jobs-bg > .max-w-6xl');
         if (site === 'uzt') return doc.querySelector('app-public-job-vacancy-detail main');
         return null;
     }
@@ -1036,24 +1738,69 @@
         });
     }
 
+    function enhanceCvltDescriptionFrame(doc) {
+        const frame = doc.querySelector('#htmlContentIframe')
+            || doc.querySelector('body > div[class~="lg:container"][class~="pt-6"] main > div[class~="px-5"][class~="py-6"] iframe');
+        if (!frame) return;
+        const enhanceFrame = currentFrame => {
+            if (!previewDescriptionFrames.has(currentFrame)) {
+                currentFrame.addEventListener('load', () => enhanceCvltDescriptionFrame(doc));
+                previewDescriptionFrames.add(currentFrame);
+            }
+            let descriptionDoc;
+            try {
+                descriptionDoc = currentFrame.contentDocument;
+            } catch {
+                return;
+            }
+            if (!descriptionDoc?.head || !descriptionDoc.body) return;
+            let style = descriptionDoc.getElementById('li-job-tools-description-style');
+            if (!style) {
+                style = descriptionDoc.createElement('style');
+                style.id = 'li-job-tools-description-style';
+                style.textContent = `
+                    .li-tools-skill { border-radius: 2px; padding: 0 2px; font-weight: 600; }
+                    .li-tools-salary-above { background: #d8f3d4 !important; color: #173d12 !important; text-decoration: underline !important; }
+                    .li-tools-salary-below { background: #ffe3dc !important; color: #5b2115 !important; text-decoration: underline wavy !important; }
+                    @media (forced-colors: active) {
+                        .li-tools-skill, .li-tools-salary-above, .li-tools-salary-below {
+                            background: Canvas !important; color: CanvasText !important; outline: 1px solid CanvasText;
+                        }
+                    }
+                `;
+                descriptionDoc.head.appendChild(style);
+            }
+            const body = descriptionDoc.body;
+            addSkillSelectionMenu(descriptionDoc, body);
+            highlightSkills(body);
+            highlightSalaries(body);
+            if (!previewObservers.has(body)) {
+                const observer = new descriptionDoc.defaultView.MutationObserver(() => {
+                    highlightSkills(body);
+                    highlightSalaries(body);
+                });
+                observer.observe(body, { childList: true, characterData: true, subtree: true });
+                previewObservers.set(body, observer);
+            }
+            descriptionDoc.querySelectorAll('iframe, frame').forEach(enhanceFrame);
+        };
+        enhanceFrame(frame);
+    }
+
     function enhanceJobPreviewFrame() {
         const doc = jobPreviewFrame?.contentDocument;
         const site = getSite();
         if (!doc?.head || !splitViewSites.has(site)) return;
+        if (site === 'pinokis') {
+            schedulePreferredCVFill(doc);
+            observePinokisAppliedConfirmation(doc);
+        }
         openPreviewLinksInNewTabs(doc);
         if (!previewLinkObservers.has(doc)) {
             const observer = new doc.defaultView.MutationObserver(records => {
-                records.forEach(record => {
-                    if (record.type === 'attributes') openPreviewLinksInNewTabs(record.target);
-                    else record.addedNodes.forEach(openPreviewLinksInNewTabs);
-                });
+                records.forEach(record => record.addedNodes.forEach(openPreviewLinksInNewTabs));
             });
-            observer.observe(doc.body, {
-                attributes: true,
-                attributeFilter: ['href', 'rel', 'target'],
-                childList: true,
-                subtree: true
-            });
+            observer.observe(doc.body, { childList: true, subtree: true });
             previewLinkObservers.set(doc, observer);
         }
         let previewStyle = doc.getElementById('li-job-tools-preview-style');
@@ -1064,20 +1811,101 @@
                 .li-tools-skill { border-radius: 2px; padding: 0 2px; font-weight: 600; }
                 .li-tools-salary-above { background: #d8f3d4 !important; color: #173d12 !important; text-decoration: underline !important; }
                 .li-tools-salary-below { background: #ffe3dc !important; color: #5b2115 !important; text-decoration: underline wavy !important; }
+                ${site === 'cvonline' ? `
+                    div.page-container > div.page-wrapper { padding-top: 0 !important; }
+                    .page-content { padding: 0 !important; }
+                    .breadcrumbs, #similarContainer, .page-content--column { display: none !important; }
+                    .vacancy-content-header-cover__area { height: 120px !important; }
+                ` : ''}
+                ${site === 'cvlt' ? `
+                    body > div[class~="lg:container"][class~="pt-6"][class~="lg:pt-12"][class~="pb-10"][class~="lg:pb-20"] {
+                        padding-top: 0 !important;
+                    }
+                    body > footer { display: none !important; }
+                    body > div[class~="lg:container"][class~="pt-6"][class~="lg:pt-12"][class~="pb-10"][class~="lg:pb-20"] > div[class~="mt-5"][class~="flex"][class~="flex-col"] {
+                        margin-top: 0 !important;
+                    }
+                    body > div[class~="lg:container"][class~="pt-6"] > div[class~="mt-5"][class~="flex"] > aside {
+                        display: none !important;
+                    }
+                    main { padding-bottom: 6rem !important; }
+                    main > header, main > hr, main > div.sticky, #send-to-friend,
+                    main > div[class~="px-5"] > .lg\\:hidden {
+                        display: none !important;
+                    }
+                    main > div[class~="px-5"][class~="py-6"] {
+                        padding: 0 !important;
+                    }
+                    #htmlContentIframe { display: block !important; border: 0 !important; }
+                    #applyArea {
+                        position: fixed !important;
+                        inset: auto auto 12px 12px !important;
+                        z-index: 100 !important;
+                        width: fit-content !important;
+                        max-width: calc(100% - 24px) !important;
+                        padding: 0 !important;
+                        background: none !important;
+                        background-image: none !important;
+                    }
+                    #applyArea > div:not(#applyButtons) { display: none !important; }
+                    #applyArea #applyButtons {
+                        display: flex !important;
+                        justify-content: flex-start !important;
+                    }
+                    #applyArea #applyButtons button, #applyArea #applyButtons a {
+                        background-color: #c8102e !important;
+                        color: #fff !important;
+                    }
+                ` : ''}
+                ${site === 'pinokis' ? `
+                    body { background: #fff !important; }
+                    #main { padding: 0 !important; }
+                    body > header, body > footer, #main > .wrapper > aside,
+                    body > div.fixed.inset-0[class~="z-[70]"] {
+                        display: none !important;
+                    }
+                    #content .jobs-bg { margin: 0 !important; }
+                    #content .jobs-bg > .container {
+                        width: 100% !important;
+                        max-width: none !important;
+                    }
+                    #content .jobs-bg > .max-w-6xl {
+                        width: 100% !important;
+                        max-width: none !important;
+                        margin: 0 !important;
+                        padding: 12px !important;
+                    }
+                    #content .jobs-bg > .max-w-6xl > nav { display: none !important; }
+                    #content .jobs-bg > .max-w-6xl > .grid {
+                        grid-template-columns: minmax(0, 1fr) !important;
+                    }
+                    #content .jobs-bg > .max-w-6xl > .grid > [class~="lg:col-span-2"] {
+                        grid-column: auto !important;
+                    }
+                ` : ''}
             `;
             doc.head.appendChild(previewStyle);
         }
         const chromeSelectors = {
             cvbankas: '#main_header',
-            cvonline: '.page-header',
+            cvonline: '.page-header, .top-banner',
             cvmarket: 'body > header nav, body > div[class~="lg:container"] > nav',
-            cvlt: 'body > header',
+            cvlt: 'body > header, a[href="/jobs"]',
+            pinokis: 'body > header, body > footer, #main > .wrapper > aside',
             uzt: '#topbar, #wrapper > header, #wrapper > nav, .quick-access-nav, nav.sort-pages'
         };
         doc.querySelectorAll(chromeSelectors[site])
             .forEach(element => element.style.setProperty('display', 'none', 'important'));
         const details = getJobPreviewDetails(doc, site);
         if (!details) return;
+        addSkillSelectionMenu(doc, details);
+        if (site !== 'cvonline') {
+            const selectedCard = getJobCards().find(card => getJobUrl(card) === selectedJobUrl);
+            if (selectedCard) {
+                const title = getJobPreviewTitle(selectedCard, details);
+                updateJobPreviewTitle(title);
+            }
+        }
         if (site === 'uzt') {
             details.querySelectorAll(`
                 nav, button, h1
@@ -1092,10 +1920,18 @@
         }
         highlightSkills(details);
         highlightSalaries(details);
+        if (site === 'cvlt') enhanceCvltDescriptionFrame(doc);
         if (!previewObservers.has(doc)) {
             const observer = new doc.defaultView.MutationObserver(() => {
                 highlightSkills(details);
                 highlightSalaries(details);
+                if (site !== 'cvonline') {
+                    const card = getJobCards().find(item => getJobUrl(item) === selectedJobUrl);
+                    if (card) {
+                        const title = getJobPreviewTitle(card, details);
+                        updateJobPreviewTitle(title);
+                    }
+                }
             });
             observer.observe(details, { childList: true, characterData: true, subtree: true });
             previewObservers.set(doc, observer);
@@ -1112,8 +1948,67 @@
             return Array.from(card.querySelectorAll('a[href]'))
                 .find(link => normalized(link.innerText) === position)?.href || '';
         }
+        if (site === 'pinokis') return card.querySelector('h2 a[href*="/darbo-skelbimai/"]')?.href || '';
         if (site === 'uzt') return card.matches('a[href]') ? card.href : '';
         return '';
+    }
+
+    function getAppliedJobKey(card) {
+        const site = getSite();
+        if (!site || site === 'linkedin') return '';
+        const href = getJobUrl(card);
+        if (href) {
+            return getAppliedJobKeyForUrl(href, site);
+        }
+        const { company, position } = getJobDetails(card);
+        return position ? `${site}:${normalized(company)}:${normalized(position)}` : '';
+    }
+
+    function getAppliedJobKeyForUrl(href, site = getSite()) {
+        const url = new URL(href, location.href);
+        return `${site}:${url.origin}${url.pathname}`;
+    }
+
+    async function markPinokisAppliedFromConfirmation(doc) {
+        if (getSite() !== 'pinokis' || !doc?.body
+            || !includesListingText(doc.body.innerText, PINOKIS_APPLIED_CONFIRMATION)) return;
+        const docUrl = new URL(doc.defaultView.location.href);
+        const vacancyUrl = /^\/darbo-skelbimai\/\d+(?:\/|$)/.test(docUrl.pathname)
+            ? docUrl.href
+            : (doc === document || doc === jobPreviewFrame?.contentDocument) ? selectedJobUrl : '';
+        if (!vacancyUrl) return;
+        const key = getAppliedJobKeyForUrl(vacancyUrl, 'pinokis');
+        if (settings.appliedJobs.includes(key) || pinokisAppliedConfirmationDocuments.has(doc)) return;
+        pinokisAppliedConfirmationDocuments.add(doc);
+        settings.appliedJobs.push(key);
+        if (!await saveSettings()) {
+            const addedIndex = settings.appliedJobs.indexOf(key);
+            if (addedIndex >= 0) settings.appliedJobs.splice(addedIndex, 1);
+            setStatus('CV upload succeeded, but the applied marker could not be saved.');
+            return;
+        }
+        getJobCards().filter(card => getAppliedJobKey(card) === key)
+            .forEach(card => {
+                const checkbox = card.querySelector('.li-tools-applied-checkbox');
+                if (checkbox) checkbox.checked = true;
+            });
+        setStatus('Pinokis CV upload confirmed; vacancy marked as applied.');
+        applyFilter();
+    }
+
+    function observePinokisAppliedConfirmation(doc) {
+        if (getSite() !== 'pinokis' || !doc?.body) return;
+        markPinokisAppliedFromConfirmation(doc).catch(error => {
+            console.error('Job Search Toolkit: could not process the Pinokis CV confirmation.', error);
+        });
+        if (pinokisAppliedConfirmationObservers.has(doc)) return;
+        const observer = new doc.defaultView.MutationObserver(() => {
+            markPinokisAppliedFromConfirmation(doc).catch(error => {
+                console.error('Job Search Toolkit: could not process the Pinokis CV confirmation.', error);
+            });
+        });
+        observer.observe(doc.body, { childList: true, characterData: true, subtree: true });
+        pinokisAppliedConfirmationObservers.add(doc);
     }
 
     function previewUrlFromHash() {
@@ -1144,6 +2039,117 @@
         });
     }
 
+    function updateJobPreviewTitle(fields) {
+        const title = Object.values(fields).filter(Boolean).join(' | ') || 'Job details';
+        if (jobPreviewFrame.title !== title) jobPreviewFrame.title = title;
+        if (jobPreviewTitle.dataset.title !== title) {
+            jobPreviewTitle.dataset.title = title;
+            jobPreviewTitle.replaceChildren();
+            const icons = {
+                position: 'M20 6h-3V4a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2v2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zM9 4h6v2H9zm11 14H4V8h16z',
+                company: 'M12 3 2 8v13h20V8zm-1 16H7v-4h4zm0-6H7V9h4zm6 6h-4v-4h4zm0-6h-4V9h4z',
+                location: 'M12 2a7 7 0 0 0-7 7c0 5.25 7 13 7 13s7-7.75 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6.5a2.5 2.5 0 0 1 0 5z',
+                salary: 'M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 16.9V20h-2v-1.1c-1.7-.3-3-1.3-3.1-3.1h2c.1.9.8 1.4 2.1 1.4 1.1 0 1.8-.5 1.8-1.2 0-.8-.7-1.1-2.2-1.5-2-.5-3.5-1.2-3.5-3.2 0-1.6 1.2-2.7 2.9-3V7h2v1.2c1.6.3 2.6 1.4 2.7 3h-2c-.1-.9-.7-1.3-1.8-1.3-1 0-1.6.4-1.6 1.1 0 .7.6 1 2.1 1.4 2.1.5 3.6 1.2 3.6 3.3 0 1.6-1.2 2.9-3 3.2z'
+            };
+            for (const [kind, value] of Object.entries(fields)) {
+                if (!value) continue;
+                const interactive = kind === 'position' || kind === 'company';
+                const pill = document.createElement(interactive ? 'button' : 'span');
+                if (interactive) {
+                    pill.type = 'button';
+                    pill.className = 'li-tools-title-pill';
+                    pill.dataset.titleKind = kind;
+                    pill.setAttribute('aria-label', `${kind[0].toUpperCase()}${kind.slice(1)}: ${value}. Open blocking actions.`);
+                } else {
+                    pill.className = 'li-tools-title-label';
+                    pill.setAttribute('role', 'group');
+                    pill.setAttribute('aria-label', `${kind[0].toUpperCase()}${kind.slice(1)}: ${value}`);
+                }
+                pill.dataset.titleValue = value;
+                pill.title = `${kind[0].toUpperCase()}${kind.slice(1)}: ${value}`;
+                const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                icon.setAttribute('viewBox', '0 0 24 24');
+                icon.setAttribute('aria-hidden', 'true');
+                icon.classList.add('li-tools-title-icon');
+                const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                path.setAttribute('d', icons[kind]);
+                icon.appendChild(path);
+                pill.append(icon, document.createTextNode(value));
+                jobPreviewTitle.appendChild(pill);
+            }
+        }
+    }
+
+    function showJobTitleMenu(event, kind, value, trigger) {
+        document.querySelector('.li-tools-title-menu')?.remove();
+        const menu = document.createElement('div');
+        menu.className = 'li-tools-title-menu';
+        menu.setAttribute('role', 'group');
+        menu.setAttribute('aria-label', 'Blocking actions');
+        menu.dataset.liJobTools = '1';
+        const options = kind === 'phrase'
+            ? [['Block phrase...', () => openBlockValueDialog(value, 'phrase'), false]]
+            : kind === 'position'
+                ? [['Block position...', () => openBlockValueDialog(value, 'position'), false]]
+                : [['Block employer', () => {
+                const card = getJobCards().find(item => getJobUrl(item) === selectedJobUrl);
+                if (card) addBlock(card, 'employer');
+            }, true]];
+        options.forEach(([label, action, restoreFocus]) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            button.addEventListener('click', () => {
+                menu.remove();
+                action();
+                if (restoreFocus) trigger?.focus();
+            });
+            menu.appendChild(button);
+        });
+        const left = Math.max(8, Math.min(event.clientX, window.innerWidth - 200));
+        const top = Math.max(8, Math.min(event.clientY, window.innerHeight - 80));
+        menu.style.left = `${left}px`;
+        menu.style.top = `${top}px`;
+        document.body.appendChild(menu);
+        menu.querySelector('button').focus();
+        const closeMenu = () => {
+            menu.remove();
+            document.removeEventListener('pointerdown', closeOnOutside, true);
+        };
+        const closeOnOutside = pointerEvent => {
+            if (!menu.contains(pointerEvent.target)) closeMenu();
+        };
+        menu.addEventListener('keydown', keyEvent => {
+            if (keyEvent.key === 'Escape') {
+                closeMenu();
+                trigger?.focus();
+            }
+        });
+        document.addEventListener('pointerdown', closeOnOutside, true);
+        menu.querySelector('button').addEventListener('click', () => {
+            document.removeEventListener('pointerdown', closeOnOutside, true);
+        }, { once: true });
+    }
+
+    function setupJobTitleActions() {
+        jobPreviewTitle.addEventListener('contextmenu', event => {
+            const selection = window.getSelection();
+            const selectedText = selection?.toString().trim();
+            const anchor = selection?.anchorNode;
+            const selectionInTitle = anchor && jobPreviewTitle.contains(anchor.nodeType === Node.ELEMENT_NODE
+                ? anchor : anchor.parentElement);
+            if (selectedText && selectionInTitle) {
+                event.preventDefault();
+                showJobTitleMenu(event, 'phrase', selectedText, null);
+                return;
+            }
+            const pill = event.target.closest('.li-tools-title-pill');
+            if (!pill) return;
+            event.preventDefault();
+            showJobTitleMenu(event, pill.dataset.titleKind, pill.dataset.titleValue, pill);
+        });
+    }
+
     function openJobPreview(card, href, updateHistory = true) {
         let url;
         try {
@@ -1154,13 +2160,12 @@
         }
         if (url.origin !== location.origin || !/^https?:$/.test(url.protocol)) return;
         selectedJobUrl = url.href;
-        jobPreviewTitle.textContent = getJobDetails(card).position || 'Job details';
-        jobPreviewFrame.title = jobPreviewTitle.textContent;
+        updateJobPreviewTitle(getJobPreviewTitle(card));
         jobPreview.hidden = false;
         if (jobPreviewFrame.src !== url.href) {
             jobPreviewFrame.setAttribute('aria-busy', 'true');
             jobPreviewFrame.src = url.href;
-        }
+        } else enhanceJobPreviewFrame();
         updateSelectedJobCard();
         if (updateHistory) setSelectedJobUrlInHistory(url.href);
     }
@@ -1211,7 +2216,8 @@
             header.id = 'li-tools-job-preview-header';
             jobPreviewTitle = document.createElement('h2');
             jobPreviewTitle.id = 'li-tools-job-preview-title';
-            jobPreviewTitle.textContent = 'Select a job';
+            jobPreviewTitle.dataset.title = '';
+            setupJobTitleActions();
             const closeButton = document.createElement('button');
             closeButton.id = 'li-tools-job-preview-close';
             closeButton.type = 'button';
@@ -1257,7 +2263,9 @@
 
     function applyFilter() {
         const site = getSite();
-        getJobCards().forEach(card => {
+        const cards = getJobCards();
+        const visibleCards = new Map();
+        cards.forEach(card => {
             ensureCardBlockMenu(card);
             const job = card.querySelector('div.job-card-container[data-job-id]') || card;
             const text = job.innerText.toLowerCase();
@@ -1265,8 +2273,11 @@
             const isPromoted = !!job.querySelector('.job-card-container__footer-item--highlighted')
                 || /\b(?:promoted|vip|premium)\b/i.test(text);
             const isViewed = text.includes('viewed');
-            const isHidden = hiddenNoticePattern.test(job.textContent || '');
-            const isApplied = text.includes('applied');
+            const hiddenKey = site !== 'linkedin' ? getAppliedJobKey(card) : '';
+            const isHidden = hiddenNoticePattern.test(job.textContent || '')
+                || (!!hiddenKey && settings.hiddenJobs.includes(hiddenKey));
+            const isApplied = text.includes('applied')
+                || (site !== 'linkedin' && settings.appliedJobs.includes(getAppliedJobKey(card)));
             const isActive = job.getAttribute('aria-current') === 'page';
             const blocked = settings.blockedPhrases.some(phrase => includesListingText(text, phrase))
                 || settings.blockedEmployers.some(employer =>
@@ -1286,13 +2297,161 @@
             if (settings.activeFilter === FILTERS.SHOW_PROMOTED) visible = visible && isPromoted;
             if (settings.activeFilter === FILTERS.SHOW_NORMAL) visible = visible && !isPromoted;
             card.classList.toggle('li-tools-filtered-out', !visible);
+            visibleCards.set(card, visible);
             if (site === 'uzt') {
                 if (visible) card.style.removeProperty('display');
                 else card.style.setProperty('display', 'none', 'important');
             }
             card.classList.toggle('li-tools-job-selected', !!selectedJobUrl && getJobUrl(card) === selectedJobUrl);
-
         });
+        const selectedIndex = cards.findIndex(card => getJobUrl(card) === selectedJobUrl);
+        if (selectedJobUrl && selectedIndex >= 0 && !visibleCards.get(cards[selectedIndex])) {
+            const nextCard = [...cards.slice(selectedIndex + 1), ...cards.slice(0, selectedIndex)]
+                .find(card => visibleCards.get(card) && getJobUrl(card));
+            if (nextCard) openJobPreview(nextCard, getJobUrl(nextCard));
+        }
+        scheduleEmptyResultsPagination(cards, visibleCards);
+    }
+
+    function paginationBaseUrl() {
+        const url = new URL(location.href);
+        for (const key of ['page', 'pageNumber', 'page_number', 'pageIndex', 'offset', 'start', 'p']) {
+            url.searchParams.delete(key);
+        }
+        const hash = new URLSearchParams(url.hash.slice(1));
+        hash.delete('li-job-tools-job');
+        url.hash = hash.toString();
+        return url.href;
+    }
+
+    function getAutoPaginationState(base) {
+        try {
+            const state = JSON.parse(sessionStorage.getItem(AUTO_PAGINATION_KEY) || 'null');
+            return state?.base === base && Array.isArray(state.attemptedPages) && Array.isArray(state.visitedUrls)
+                ? state : null;
+        } catch (error) {
+            console.warn('Job Search Toolkit: could not read auto-pagination state.', error);
+            return null;
+        }
+    }
+
+    function setAutoPaginationState(state) {
+        try {
+            sessionStorage.setItem(AUTO_PAGINATION_KEY, JSON.stringify(state));
+            return true;
+        } catch (error) {
+            console.error('Job Search Toolkit: could not save auto-pagination state.', error);
+            return false;
+        }
+    }
+
+    function clearAutoPaginationState() {
+        try {
+            sessionStorage.removeItem(AUTO_PAGINATION_KEY);
+        } catch (error) {
+            console.warn('Job Search Toolkit: could not clear auto-pagination state.', error);
+        }
+    }
+
+    function findNextPageControl() {
+        const pagination = Array.from(document.querySelectorAll(
+            'nav[aria-label*="pagination" i], [class*="pagination" i], [id*="pagination" i], [aria-label*="pagination" i], nav, [role="navigation"], ul, mat-paginator'
+        ));
+        const controls = Array.from(new Set([
+            ...document.querySelectorAll('a[rel~="next" i], button[rel~="next" i]'),
+            ...pagination.flatMap(container => Array.from(container.querySelectorAll('a[href], button')))
+        ]));
+        const nextLabel = /^(?:next(?:\s+page)?|kitas(?:\s+puslapis)?|toliau|sekantis(?:\s+puslapis)?|pirmyn)$/i;
+        const nextControl = controls.find(control => {
+            if (!control.getClientRects().length || control.matches(':disabled, [aria-disabled="true"]')
+                || control.closest('[aria-disabled="true"], .disabled, .is-disabled')) return false;
+            const href = control instanceof HTMLAnchorElement ? control.href : '';
+            if (href && (!/^https?:$/.test(new URL(href).protocol) || new URL(href).origin !== location.origin)) return false;
+            const labels = [
+                control.getAttribute('aria-label'),
+                control.getAttribute('title'),
+                control.innerText
+            ].filter(Boolean).map(label => label.trim());
+            return control.relList?.contains('next')
+                || labels.some(label => nextLabel.test(label))
+                || (labels.some(label => /^(?:›|»|→|⟩|>)$/.test(label))
+                    && pagination.some(container => container.contains(control)));
+        });
+        if (nextControl) return nextControl;
+
+        for (const container of pagination) {
+            const current = Array.from(container.querySelectorAll(
+                '[aria-current="page"], [aria-disabled="true"], .active, .current, .selected, [class*="bg-brand"]'
+            )).find(element => /^\d+$/.test(element.textContent.trim()));
+            if (!current) continue;
+            const currentPage = Number(current.textContent.trim());
+            const numberedNext = Array.from(container.querySelectorAll('a[href], button')).find(control =>
+                control.textContent.trim() === String(currentPage + 1)
+                && control.getClientRects().length
+                && !control.matches(':disabled, [aria-disabled="true"]')
+                && !control.closest('[aria-disabled="true"], .disabled, .is-disabled')
+                && (!(control instanceof HTMLAnchorElement) || new URL(control.href).origin === location.origin)
+            );
+            if (numberedNext) return numberedNext;
+        }
+    }
+
+    function closeEmptyResultsPreview() {
+        if (selectedJobUrl) closeJobPreview();
+    }
+
+    function scheduleEmptyResultsPagination(cards, visibleCards) {
+        clearTimeout(autoPaginationTimer);
+        const visible = cards.filter(card => visibleCards.get(card));
+        const base = paginationBaseUrl();
+        const state = getAutoPaginationState(base);
+        if (visible.length) {
+            if (state) {
+                clearAutoPaginationState();
+                attemptedPaginationPages.clear();
+                if (splitViewSites.has(getSite()) && window.matchMedia('(min-width: 1200px)').matches) {
+                    const firstResult = visible.find(card => getJobUrl(card));
+                    if (firstResult) openJobPreview(firstResult, getJobUrl(firstResult));
+                }
+            }
+            return;
+        }
+        if (!getSite()) return;
+        autoPaginationTimer = setTimeout(() => {
+            const currentCards = getJobCards();
+            if (currentCards.some(card => !card.classList.contains('li-tools-filtered-out'))) {
+                scheduleEmptyResultsPagination(currentCards, new Map(currentCards.map(card => [
+                    card, !card.classList.contains('li-tools-filtered-out')
+                ])));
+                return;
+            }
+            const currentBase = paginationBaseUrl();
+            let currentState = getAutoPaginationState(currentBase)
+                || { base: currentBase, attemptedPages: [], visitedUrls: [] };
+            const activePage = document.querySelector(
+                'nav[aria-label*="pagination" i] [aria-current="page"], [class*="pagination" i] [aria-current="page"], [class*="pagination" i] .active'
+            )?.textContent.trim() || '';
+            const pageKey = `${location.href}|${activePage}|${currentCards.map(getJobUrl).join('|')}`;
+            if (currentState.attemptedPages.includes(pageKey) || attemptedPaginationPages.has(pageKey)) return;
+            const next = findNextPageControl();
+            if (!next) {
+                clearAutoPaginationState();
+                attemptedPaginationPages.clear();
+                closeEmptyResultsPreview();
+                return;
+            }
+            const nextUrl = next instanceof HTMLAnchorElement ? next.href : '';
+            if (nextUrl && currentState.visitedUrls.includes(nextUrl)) {
+                clearAutoPaginationState();
+                closeEmptyResultsPreview();
+                return;
+            }
+            currentState.attemptedPages.push(pageKey);
+            currentState.visitedUrls.push(location.href);
+            if (nextUrl) currentState.visitedUrls.push(nextUrl);
+            attemptedPaginationPages.add(pageKey);
+            if (setAutoPaginationState(currentState)) next.click();
+        }, 500);
     }
 
     function unwrapHighlights(root, selector) {
@@ -1439,6 +2598,65 @@
             || salaryContextPattern.test(`${precedingText.slice(-60)} ${followingText.slice(0, 60)}`);
     }
 
+    function getJobPreviewTitle(card, details) {
+        const { position, company } = getJobDetails(card);
+        const roots = [details, card].filter(Boolean);
+        const locationSelector = '[itemprop="jobLocation"], [data-testid*="location" i], [class*="location" i], [class*="city" i], [class*="place" i]';
+        let location = '';
+        if (getSite() === 'cvonline') {
+            const listingLines = card.innerText.split('\n').map(line => line.trim()).filter(Boolean);
+            const companyLocation = listingLines.find(line => line.includes('/') && /\s+[—–-]\s+/.test(line));
+            if (companyLocation) location = companyLocation.split(/\s+[—–-]\s+/).slice(1).join(' — ');
+        }
+        if (getSite() === 'pinokis') {
+            const locationLink = Array.from(card.querySelectorAll('a[href*="/darbas-"]'))
+                .find(link => link.querySelector('.mi'));
+            location = locationLink?.innerText.split('\n').map(line => line.trim())
+                .map(line => line.replace(/^(?:place|location_on)\s+/i, ''))
+                .filter(line => line && !/^(?:place|location_on)$/i.test(line)).join(' ') || '';
+        }
+        for (const root of location ? [] : roots) {
+            const candidates = Array.from(root.querySelectorAll(locationSelector))
+                .map(element => element.innerText.trim().replace(/\s+/g, ' '))
+                .filter(value => value && value.length <= 100 && !/^(?:location|city|place|miestas|darbo vieta)$/i.test(value))
+                .sort((left, right) => left.length - right.length);
+            if (candidates.length) {
+                location = candidates[0];
+                break;
+            }
+            const lines = root.innerText.split('\n').map(line => line.trim()).filter(Boolean);
+            const labelPattern = /^(?:location|city|place|miestas|miesto|darbo vieta)\s*:?\s*/i;
+            const locationLine = lines.findIndex(line => /^(?:location|city|place|miestas|miesto|darbo vieta)\s*:/i.test(line));
+            const labelIndex = lines.findIndex(line => /^(?:location|city|place|miestas|miesto|darbo vieta)$/i.test(line));
+            const labelLine = locationLine >= 0 ? lines[locationLine].replace(labelPattern, '')
+                : labelIndex >= 0 ? lines[labelIndex + 1] || '' : '';
+            if (labelLine) {
+                location = labelLine;
+                break;
+            }
+        }
+
+        const salarySelector = '.salary-label, .salary_text, [data-component="badge"], [class*="salary" i], [data-testid*="salary" i]';
+        const salaryRoots = roots.flatMap(root => {
+            const elements = Array.from(root.querySelectorAll(salarySelector));
+            return elements.length ? elements : [root];
+        });
+        let salary = '';
+        for (const root of salaryRoots) {
+            const lines = root.innerText.split('\n').map(line => line.trim()).filter(Boolean);
+            for (const line of lines) {
+                const match = Array.from(line.matchAll(new RegExp(salaryMatcher.source, salaryMatcher.flags)))
+                    .find(item => isSalaryMatch(item[0], line.slice(0, item.index), line.slice(item.index + item[0].length)));
+                if (match) {
+                    salary = match[0].trim();
+                    break;
+                }
+            }
+            if (salary) break;
+        }
+        return { position, company, location, salary };
+    }
+
     function salaryMeetsFilter(card) {
         if (settings.salaryMinimum <= 0) return true;
         const salaryFloor = settings.salaryMinimum * (1 - SALARY_FILTER_TOLERANCE);
@@ -1495,6 +2713,15 @@
     function applyNativeSalarySearch(form, site = getSite()) {
         if (settings.salaryMinimum <= 0) return;
         const salaryFloor = String(Math.floor(settings.salaryMinimum * (1 - SALARY_FILTER_TOLERANCE)));
+        if (site === 'pinokis') {
+            const control = form.querySelector('select[name="salary"]');
+            if (!control || Number(control.value) >= Number(salaryFloor)) return;
+            const option = Array.from(control.options)
+                .filter(item => Number(item.value) > 0 && Number(item.value) <= Number(salaryFloor))
+                .sort((first, second) => Number(second.value) - Number(first.value))[0];
+            if (option) setSearchControlValue(control, option.value);
+            return;
+        }
         if (site === 'cvlt') {
             if (!form.querySelector('[name="search[keyword]"]')) return;
             const searchParams = new URL(location.href).searchParams;
@@ -1696,6 +2923,48 @@
         });
     }
 
+    function openBlockValueDialog(value, kind) {
+        const isPhrase = kind === 'phrase';
+        const labelText = isPhrase ? 'Phrase to block' : 'Position to block';
+        const titleText = isPhrase ? 'Block phrase' : 'Block position';
+        const listKey = isPhrase ? 'blockedPhrases' : 'blockedPositions';
+        const dialog = document.createElement('dialog');
+        dialog.id = 'li-tools-block-value-dialog';
+        dialog.setAttribute('aria-labelledby', 'li-tools-block-value-title');
+        const title = document.createElement('h2');
+        title.id = 'li-tools-block-value-title';
+        title.textContent = titleText;
+        const form = document.createElement('form');
+        const fieldLabel = document.createElement('label');
+        fieldLabel.htmlFor = 'li-tools-block-value-input';
+        fieldLabel.textContent = `${labelText} (required)`;
+        const input = document.createElement('input');
+        input.id = fieldLabel.htmlFor;
+        input.type = 'text';
+        input.value = value;
+        input.required = true;
+        const actions = document.createElement('div');
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.textContent = 'Cancel';
+        cancel.addEventListener('click', () => dialog.close());
+        const save = document.createElement('button');
+        save.type = 'submit';
+        save.textContent = isPhrase ? 'Save phrase' : 'Save position';
+        actions.append(cancel, save);
+        form.append(fieldLabel, input, actions);
+        form.addEventListener('submit', async event => {
+            event.preventDefault();
+            if (await addListEntry(listKey, [input.value])) dialog.close();
+            else input.focus();
+        });
+        dialog.append(title, form);
+        dialog.addEventListener('close', () => dialog.remove(), { once: true });
+        document.body.appendChild(dialog);
+        dialog.showModal();
+        input.focus();
+    }
+
     function addBlockActions(menu, card, closeMenu) {
         const section = document.createElement('div');
         section.className = 'li-tools-menu';
@@ -1717,6 +2986,16 @@
             });
             section.appendChild(button);
         }
+        const phraseButton = document.createElement('button');
+        phraseButton.type = 'button';
+        phraseButton.textContent = 'Block phrase...';
+        phraseButton.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            closeMenu();
+            openBlockValueDialog(getJobDetails(card).position, 'phrase');
+        });
+        section.appendChild(phraseButton);
         menu.appendChild(section);
     }
 
@@ -1750,6 +3029,54 @@
         const { company, position } = getJobDetails(card);
         trigger.setAttribute('aria-label', `Job tools for ${position || 'listing'}${company ? ` at ${company}` : ''}`);
         trigger.setAttribute('aria-expanded', 'false');
+        if (!isLinkedIn) {
+            const appliedKey = getAppliedJobKey(card);
+            const appliedCheckbox = document.createElement('input');
+            appliedCheckbox.type = 'checkbox';
+            appliedCheckbox.className = 'li-tools-applied-checkbox';
+            appliedCheckbox.dataset.liJobTools = '1';
+            appliedCheckbox.setAttribute('aria-label', `Mark ${position || 'listing'}${company ? ` at ${company}` : ''} as applied`);
+            appliedCheckbox.title = 'Mark as applied';
+            appliedCheckbox.checked = !!appliedKey && settings.appliedJobs.includes(appliedKey);
+            appliedCheckbox.disabled = !appliedKey;
+            appliedCheckbox.addEventListener('click', event => {
+                event.stopPropagation();
+            });
+            appliedCheckbox.addEventListener('change', async () => {
+                if (appliedCheckbox.checked) {
+                    if (!settings.appliedJobs.includes(appliedKey)) settings.appliedJobs.push(appliedKey);
+                } else {
+                    settings.appliedJobs = settings.appliedJobs.filter(key => key !== appliedKey);
+                }
+                const saved = await saveSettings();
+                applyFilter();
+                setStatus(saved ? 'Applied status saved.' : 'Could not save applied status. Check the console.');
+            });
+            actions.appendChild(appliedCheckbox);
+
+            const hiddenCheckbox = document.createElement('input');
+            hiddenCheckbox.type = 'checkbox';
+            hiddenCheckbox.className = 'li-tools-hidden-checkbox';
+            hiddenCheckbox.dataset.liJobTools = '1';
+            hiddenCheckbox.setAttribute('aria-label', `Mark ${position || 'listing'}${company ? ` at ${company}` : ''} as hidden`);
+            hiddenCheckbox.title = 'Mark as hidden';
+            hiddenCheckbox.checked = !!appliedKey && settings.hiddenJobs.includes(appliedKey);
+            hiddenCheckbox.disabled = !appliedKey;
+            hiddenCheckbox.addEventListener('click', event => {
+                event.stopPropagation();
+            });
+            hiddenCheckbox.addEventListener('change', async () => {
+                if (hiddenCheckbox.checked) {
+                    if (!settings.hiddenJobs.includes(appliedKey)) settings.hiddenJobs.push(appliedKey);
+                } else {
+                    settings.hiddenJobs = settings.hiddenJobs.filter(key => key !== appliedKey);
+                }
+                const saved = await saveSettings();
+                applyFilter();
+                setStatus(saved ? 'Hidden status saved.' : 'Could not save hidden status. Check the console.');
+            });
+            actions.appendChild(hiddenCheckbox);
+        }
         const menu = document.createElement('div');
         menu.id = `li-tools-card-menu-${++cardMenuId}`;
         menu.className = 'li-tools-card-menu';
@@ -1832,6 +3159,8 @@
 
     function processPage() {
         updateLayout();
+        schedulePreferredCVFill();
+        observePinokisAppliedConfirmation(document);
         setupJobPreview();
         enhanceJobPreviewFrame();
         applyFilter();
